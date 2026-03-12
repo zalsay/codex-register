@@ -1,0 +1,8 @@
+codex_tokens/
+.venv/
+.env
+__pycache__/
+ak.txt
+rk.txt
+registered_accounts.txt
+run_counter.json
