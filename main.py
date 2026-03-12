@@ -536,6 +536,20 @@ def _save_codex_tokens(email: str, tokens: dict):
     if UPLOAD_API_URL or SCP_TARGETS:
         _upload_token_json(token_path)
 
+    # 复制文件到指定目录
+    copy_to_path = os.environ.get("COPY_TO_PATH", "").strip()
+    if copy_to_path:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        ak_src = AK_FILE if os.path.isabs(AK_FILE) else os.path.join(base_dir, AK_FILE)
+        rk_src = RK_FILE if os.path.isabs(RK_FILE) else os.path.join(base_dir, RK_FILE)
+
+        os.makedirs(copy_to_path, exist_ok=True)
+        import shutil
+        shutil.copy(ak_src, copy_to_path)
+        shutil.copy(rk_src, copy_to_path)
+        shutil.copy(token_path, copy_to_path)
+        print(f"[Info] 已复制文件到: {copy_to_path}")
+
 
 def _build_scp_target(filepath: str, target: dict) -> str:
     filename = os.path.basename(filepath)
@@ -2008,7 +2022,10 @@ def main():
 if __name__ == "__main__":
     import random
     import time
-    delay = random.randint(1, 600)
-    print(f"[Info] 随机延迟 {delay} 秒后开始执行...")
-    time.sleep(delay)
+    import sys
+    no_delay = "-n" in sys.argv
+    if not no_delay:
+        delay = random.randint(1, 600)
+        print(f"[Info] 随机延迟 {delay} 秒后开始执行...")
+        time.sleep(delay)
     main()
