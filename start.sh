@@ -1,16 +1,8 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+cd "$(dirname "$0")"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
-
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-fi
-
-# shellcheck disable=SC1091
+echo "Activating virtual environment..."
 source .venv/bin/activate
 
-pip install -r requirements.txt
-
+echo "Running main.py..."
 python main.py
