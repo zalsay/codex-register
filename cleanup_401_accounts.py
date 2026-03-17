@@ -46,34 +46,31 @@ def _as_bool(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+def _parse_urls(value: str) -> List[str]:
+    if not value:
+        return []
+    parts = [item.strip() for item in value.split(",")]
+    return [item for item in parts if item]
 
 
 def load_config() -> dict:
     config = DEFAULT_CONFIG.copy()
-    config_path = os.path.join(BASE_DIR, "config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config.update(json.load(f))
-        except Exception as exc:  # pragma: no cover
-            print(f"⚠️ 加载 config.json 失败: {exc}")
-
-    config["management_api_url"] = os.environ.get(
+    raw_urls = os.environ.get("MANAGEMENT_API_URLS") or os.environ.get(
         "MANAGEMENT_API_URL", config["management_api_url"]
     )
+    config["management_api_urls"] = _parse_urls(raw_urls)
     config["management_api_token"] = os.environ.get(
         "MANAGEMENT_API_TOKEN", config["management_api_token"]
     )
     config["proxy"] = os.environ.get("PROXY", config["proxy"])
-    config["timeout"] = int(os.environ.get("MANAGEMENT_API_TIMEOUT", config["timeout"]))
+    config["timeout"] = int(
+        os.environ.get("MANAGEMENT_API_TIMEOUT", config["timeout"])
+    )
     config["delete_delay"] = float(
         os.environ.get("MANAGEMENT_DELETE_DELAY", config["delete_delay"])
+    )
+    config["management_debug"] = _as_bool(
+        os.environ.get("MANAGEMENT_DEBUG", config["management_debug"])
     )
     return config
 
@@ -117,8 +114,7 @@ def _iter_auth_files(data: object) -> Iterable[dict]:
                 return
 
 
-def fetch_auth_files(config: dict) -> List[dict]:
-    url = config["management_api_url"].rstrip("/")
+def fetch_auth_files(config: dict, url: str) -> List[dict]:
     proxies = {"http": config["proxy"], "https": config["proxy"]} if config["proxy"] else None
     response = curl_requests.get(
         url,
@@ -156,10 +152,9 @@ def fetch_auth_files(config: dict) -> List[dict]:
     return list(_iter_auth_files(payload))
 
 
-def delete_auth_file(config: dict, name: str) -> bool:
+def delete_auth_file(config: dict, base_url: str, name: str) -> bool:
     if not name:
         return False
-    base_url = config["management_api_url"].rstrip("/")
     encoded = quote(name, safe="")
     url = f"{base_url}?name={encoded}"
     proxies = {"http": config["proxy"], "https": config["proxy"]} if config["proxy"] else None
@@ -177,36 +172,42 @@ def main() -> None:
     config = load_config()
     if not config["management_api_token"]:
         print("⚠️ 未设置管理接口 Token，可在 .env 中设置")
-    print("🔎 正在获取 auth-files 列表...")
-    items = fetch_auth_files(config)
-    print(f"✅ 获取到 {len(items)} 条记录")
-
-    targets = []
-    for item in items:
-        status_message = item.get("status_message")
-        status_code = _extract_status_code(status_message)
-        if status_code == 401:
-            name = item.get("name") or item.get("id")
-            if name:
-                targets.append(name)
-
-    if not targets:
-        print("🎉 未发现 401 账号")
+    urls = [url.rstrip("/") for url in config.get("management_api_urls", [])]
+    if not urls:
+        print("⚠️ 未设置管理接口 URL，可在 .env 中设置")
         return
 
-    print(f"🧹 发现 {len(targets)} 个 401 账号，准备删除...")
-    success = 0
-    for idx, name in enumerate(targets, start=1):
-        try:
-            delete_auth_file(config, name)
-            success += 1
-            print(f"✅ [{idx}/{len(targets)}] 删除成功: {name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"❌ [{idx}/{len(targets)}] 删除失败: {name} -> {exc}")
-        if config["delete_delay"]:
-            time.sleep(config["delete_delay"])
+    for url in urls:
+        print(f"🔎 正在获取 auth-files 列表: {url}")
+        items = fetch_auth_files(config, url)
+        print(f"✅ 获取到 {len(items)} 条记录")
 
-    print(f"✅ 删除完成: {success}/{len(targets)}")
+        targets = []
+        for item in items:
+            status_message = item.get("status_message")
+            status_code = _extract_status_code(status_message)
+            if status_code == 401:
+                name = item.get("name") or item.get("id")
+                if name:
+                    targets.append(name)
+
+        if not targets:
+            print("🎉 未发现 401 账号")
+            continue
+
+        print(f"🧹 发现 {len(targets)} 个 401 账号，准备删除...")
+        success = 0
+        for idx, name in enumerate(targets, start=1):
+            try:
+                delete_auth_file(config, url, name)
+                success += 1
+                print(f"✅ [{idx}/{len(targets)}] 删除成功: {name}")
+            except Exception as exc:  # pragma: no cover
+                print(f"❌ [{idx}/{len(targets)}] 删除失败: {name} -> {exc}")
+            if config["delete_delay"]:
+                time.sleep(config["delete_delay"])
+
+        print(f"✅ 删除完成: {success}/{len(targets)}")
 
 
 if __name__ == "__main__":
