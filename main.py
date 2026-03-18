@@ -203,6 +203,77 @@ UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
 SCP_TARGETS = _parse_scp_targets(_CONFIG)
 
+# 当前运行选中的 SCP host（轮询）
+_CURRENT_SCP_HOST_INDEX = None
+
+_SCP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scp_state.json")
+
+
+def _get_current_scp_index() -> int:
+    """获取当前运行应使用的 SCP host 索引（从 scp_state.json 读取上次使用的 host，下次使用下一个）"""
+    global _CURRENT_SCP_HOST_INDEX
+    if _CURRENT_SCP_HOST_INDEX is not None:
+        return _CURRENT_SCP_HOST_INDEX
+
+    if not SCP_TARGETS:
+        _CURRENT_SCP_HOST_INDEX = -1
+        return _CURRENT_SCP_HOST_INDEX
+
+    # 读取上次使用的 host 索引
+    last_index = 0
+    if os.path.exists(_SCP_STATE_FILE):
+        try:
+            with open(_SCP_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                last_index = data.get("last_scp_index", 0)
+        except Exception:
+            last_index = 0
+
+    # 使用下一个 host（循环）
+    _CURRENT_SCP_HOST_INDEX = (last_index + 1) % len(SCP_TARGETS)
+    return _CURRENT_SCP_HOST_INDEX
+
+
+def _get_host_run_count(host_index: int) -> int:
+    """获取某个 host 被使用的次数"""
+    if not os.path.exists(_SCP_STATE_FILE):
+        return 0
+    try:
+        with open(_SCP_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        counts = data.get("host_counts", [])
+        if isinstance(counts, list) and 0 <= host_index < len(counts):
+            return counts[host_index]
+        return 0
+    except Exception:
+        return 0
+
+
+def _increment_host_run_count(host_index: int) -> None:
+    """增加某个 host 的使用次数"""
+    try:
+        data = {"last_scp_index": _CURRENT_SCP_HOST_INDEX, "host_counts": [0] * len(SCP_TARGETS)}
+        if os.path.exists(_SCP_STATE_FILE):
+            with open(_SCP_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        counts = data.get("host_counts")
+        if not isinstance(counts, list) or len(counts) != len(SCP_TARGETS):
+            counts = [0] * len(SCP_TARGETS)
+        counts[host_index] = counts[host_index] + 1
+        data["host_counts"] = counts
+        with open(_SCP_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _save_current_scp_index() -> None:
+    """运行结束后保存当前使用的 SCP host 索引到文件"""
+    if not SCP_TARGETS or _CURRENT_SCP_HOST_INDEX < 0:
+        return
+    _increment_host_run_count(_CURRENT_SCP_HOST_INDEX)
+
+
 if not DUCKMAIL_BEARER:
     print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
     print("   文件: config.json -> duckmail_bearer")
@@ -586,9 +657,13 @@ def _upload_token_json_scp(filepath: str, target: dict) -> None:
 
 
 def _upload_token_json(filepath):
-    """上传 Token JSON 文件到 CPA 管理平台"""
+    """上传 Token JSON 文件到 CPA 管理平台（只上传到当前运行的选中 host）"""
     if SCP_TARGETS:
-        for target in SCP_TARGETS:
+        idx = _get_current_scp_index()
+        if idx >= 0 and idx < len(SCP_TARGETS):
+            target = SCP_TARGETS[idx]
+            with _print_lock:
+                print(f"  [SCP] 上传到 host {idx + 1}/{len(SCP_TARGETS)}: {target.get('host', '')}")
             _upload_token_json_scp(filepath, target)
         return
 
@@ -1936,6 +2011,17 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         print(f"  OAuth Issuer: {OAUTH_ISSUER}")
         print(f"  OAuth Client: {OAUTH_CLIENT_ID}")
         print(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
+    if SCP_TARGETS:
+        idx = _get_current_scp_index()
+        target = SCP_TARGETS[idx] if 0 <= idx < len(SCP_TARGETS) else None
+        if target:
+            print(f"  SCP上传: host {idx + 1}/{len(SCP_TARGETS)} ({target.get('host', '')})")
+        # 打印各 host 使用次数
+        print(f"  SCP hosts: ", end="")
+        for i, t in enumerate(SCP_TARGETS):
+            host = t.get("host", "")
+            print(f"[{i+1}]{host}={_get_host_run_count(i)}次", end=" ")
+        print()
     print(f"  输出文件: {output_file}")
     print(f"{'#'*60}\n")
 
@@ -1974,6 +2060,9 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     if success_count > 0:
         print(f"  结果文件: {output_file}")
     print(f"{'#'*60}")
+
+    # 保存当前 SCP host 索引，下次运行使用下一个
+    _save_current_scp_index()
 
 
 def main():
