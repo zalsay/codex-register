@@ -11,8 +11,8 @@ echo "Activating virtual environment..."
 source .venv/bin/activate
 
 # 安装依赖
-echo "Installing dependencies..."
-pip install --quiet curl_cffi python-dotenv
+# echo "Installing dependencies..."
+# pip install --quiet curl_cffi python-dotenv
 
 echo "Running main.py..."
-python main.py
+python3 main.py

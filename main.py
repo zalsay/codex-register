@@ -201,7 +201,7 @@ RK_FILE = _CONFIG["rk_file"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
-SCP_TARGETS = _parse_scp_targets(_CONFIG)
+SCP_TARGETS = []  # SCP 上传已关闭
 
 # 当前运行选中的 SCP host（轮询）
 _CURRENT_SCP_HOST_INDEX = None
