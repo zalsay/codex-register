@@ -5,7 +5,6 @@ ChatGPT 批量自动注册工具 (并发版) - DuckMail 临时邮箱版
 """
 
 import os
-import posixpath
 import re
 import uuid
 import json
@@ -13,7 +12,6 @@ import random
 import string
 import time
 import sys
-import subprocess
 import threading
 import traceback
 import secrets
@@ -22,54 +20,17 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs, urlencode
 
-from curl_cffi import requests as curl_requests
 from dotenv import load_dotenv
+from curl_cffi import requests as curl_requests
 
-_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(_ENV_PATH)
-
-
-# ================= 运行次数管理 =================
-def _get_run_number(base_dir: str) -> int:
-    """获取当前运行次数，子目录从 1 开始编号"""
-    counter_file = os.path.join(base_dir, "run_counter.json")
-    
-    if os.path.exists(counter_file):
-        try:
-            with open(counter_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("run_number", 1)
-        except Exception:
-            pass
-    
-    return 1
-
-
-def _increment_run_number(base_dir: str) -> int:
-    """增加运行次数并返回当前编号"""
-    counter_file = os.path.join(base_dir, "run_counter.json")
-    current_run = 1
-    
-    if os.path.exists(counter_file):
-        try:
-            with open(counter_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                current_run = data.get("run_number", 0) + 1
-        except Exception:
-            current_run = 1
-    
-    # 保存新的运行次数
-    with open(counter_file, "w", encoding="utf-8") as f:
-        json.dump({"run_number": current_run}, f)
-    
-    return current_run
-
+# 加载 .env 环境变量
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ================= 加载配置 =================
 def _load_config():
     """从 config.json 加载配置，环境变量优先级更高"""
     config = {
-        "total_accounts": 10,
+        "total_accounts": 3,
         "duckmail_api_base": "https://api.duckmail.sbs",
         "duckmail_bearer": "",
         "proxy": "",
@@ -84,11 +45,7 @@ def _load_config():
         "token_json_dir": "codex_tokens",
         "upload_api_url": "",
         "upload_api_token": "",
-        "scp_targets": [],
-        "scp_host": "",
-        "scp_path": "",
-        "scp_port": "",
-        "scp_user": "",
+        "cpa_cleanup_enabled": True,
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -115,11 +72,6 @@ def _load_config():
     config["token_json_dir"] = os.environ.get("TOKEN_JSON_DIR", config["token_json_dir"])
     config["upload_api_url"] = os.environ.get("UPLOAD_API_URL", config["upload_api_url"])
     config["upload_api_token"] = os.environ.get("UPLOAD_API_TOKEN", config["upload_api_token"])
-    config["scp_targets"] = os.environ.get("SCP_TARGETS", config["scp_targets"])
-    config["scp_host"] = os.environ.get("SCP_HOST", config["scp_host"])
-    config["scp_path"] = os.environ.get("SCP_PATH", config["scp_path"])
-    config["scp_port"] = os.environ.get("SCP_PORT", config["scp_port"])
-    config["scp_user"] = os.environ.get("SCP_USER", config["scp_user"])
 
     return config
 
@@ -130,59 +82,6 @@ def _as_bool(value):
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _should_abort_on_error(error_msg: str) -> bool:
-    if not error_msg:
-        return False
-    if "DuckMail 创建邮箱失败" not in error_msg:
-        return False
-    lower_msg = error_msg.lower()
-    return "operation timed out" in lower_msg or "curl: (28)" in lower_msg
-
-
-def _parse_scp_targets(config: dict) -> list:
-    raw_targets = config.get("scp_targets")
-    if isinstance(raw_targets, str):
-        raw_targets = raw_targets.strip()
-        if raw_targets:
-            try:
-                raw_targets = json.loads(raw_targets)
-            except Exception:
-                raw_targets = []
-        else:
-            raw_targets = []
-
-    targets = []
-    if isinstance(raw_targets, dict):
-        raw_targets = [raw_targets]
-    if isinstance(raw_targets, list):
-        for item in raw_targets:
-            if not isinstance(item, dict):
-                continue
-            host = str(item.get("host", "")).strip()
-            path = str(item.get("path", "")).strip()
-            if not host or not path:
-                continue
-            target = {
-                "host": host,
-                "path": path,
-                "port": item.get("port", ""),
-                "user": item.get("user", ""),
-            }
-            targets.append(target)
-
-    legacy_host = str(config.get("scp_host", "")).strip()
-    legacy_path = str(config.get("scp_path", "")).strip()
-    if legacy_host and legacy_path:
-        targets.append({
-            "host": legacy_host,
-            "path": legacy_path,
-            "port": config.get("scp_port", ""),
-            "user": config.get("scp_user", ""),
-        })
-
-    return targets
 
 
 _CONFIG = _load_config()
@@ -201,7 +100,7 @@ RK_FILE = _CONFIG["rk_file"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
-SCP_TARGETS = _parse_scp_targets(_CONFIG)
+CPA_CLEANUP_ENABLED = _as_bool(_CONFIG.get("cpa_cleanup_enabled", True))
 
 if not DUCKMAIL_BEARER:
     print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
@@ -520,11 +419,7 @@ def _save_codex_tokens(email: str, tokens: dict):
     }
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    token_base_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
-    
-    # 获取当前运行次数，创建子目录
-    run_number = _get_run_number(base_dir)
-    token_dir = os.path.join(token_base_dir, f"run_{run_number}")
+    token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
     os.makedirs(token_dir, exist_ok=True)
 
     token_path = os.path.join(token_dir, f"{email}.json")
@@ -532,89 +427,476 @@ def _save_codex_tokens(email: str, tokens: dict):
         with open(token_path, "w", encoding="utf-8") as f:
             json.dump(token_data, f, ensure_ascii=False)
 
-    # 上传到 CPA 管理平台
-    if UPLOAD_API_URL or SCP_TARGETS:
-        _upload_token_json(token_path)
 
 
-def _build_scp_target(filepath: str, target: dict) -> str:
-    filename = os.path.basename(filepath)
-    remote_path = str(target.get("path", "")).strip()
-    if remote_path.endswith("/"):
-        remote_path = posixpath.join(remote_path, filename)
-    host = str(target.get("host", "")).strip()
-    target_str = f"{host}:{remote_path}"
-    user = str(target.get("user", "")).strip()
-    if user:
-        target_str = f"{user}@{target_str}"
-    return target_str
-
-
-def _upload_token_json_scp(filepath: str, target: dict) -> None:
-    """使用 scp 上传 Token JSON 文件"""
-    try:
-        target_str = _build_scp_target(filepath, target)
-        cmd = ["scp", "-q", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
-        port = str(target.get("port", "")).strip()
-        if port:
-            cmd += ["-P", port]
-        cmd += [filepath, target_str]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        with _print_lock:
-            print(f"  [SCP] Token JSON 已上传到 {target_str}")
-    except subprocess.CalledProcessError as e:
-        message = (e.stderr or e.stdout or "").strip()
-        with _print_lock:
-            print(f"  [SCP] 上传失败: {message or e}")
-    except Exception as e:
-        with _print_lock:
-            print(f"  [SCP] 上传异常: {e}")
-
-
-def _upload_token_json(filepath):
-    """上传 Token JSON 文件到 CPA 管理平台"""
-    if SCP_TARGETS:
-        for target in SCP_TARGETS:
-            _upload_token_json_scp(filepath, target)
-        return
-
+def _upload_token_json(filepath, proxy=None):
+    """上传单个 token JSON 文件到 CPA 管理平台"""
     mp = None
     try:
         from curl_cffi import CurlMime
-
         filename = os.path.basename(filepath)
         mp = CurlMime()
-        mp.addpart(
-            name="file",
-            content_type="application/json",
-            filename=filename,
-            local_path=filepath,
-        )
-
+        mp.addpart(name="file", content_type="application/json",
+                   filename=filename, local_path=filepath)
         session = curl_requests.Session()
-        if DEFAULT_PROXY:
-            session.proxies = {"http": DEFAULT_PROXY, "https": DEFAULT_PROXY}
-
-        resp = session.post(
-            UPLOAD_API_URL,
-            multipart=mp,
-            headers={"Authorization": f"Bearer {UPLOAD_API_TOKEN}"},
-            verify=False,
-            timeout=30,
-        )
-
+        # 只有当 proxy 明确有值时才使用代理
+        # proxy=None 或 空字符串 表示不使用代理
+        if proxy:
+            session.proxies = {"http": proxy, "https": proxy}
+        resp = session.post(UPLOAD_API_URL, multipart=mp,
+                            headers={"Authorization": f"Bearer {UPLOAD_API_TOKEN}"},
+                            verify=False, timeout=30)
         if resp.status_code == 200:
-            with _print_lock:
-                print(f"  [CPA] Token JSON 已上传到 CPA 管理平台")
+            print(f"  [CPA] ✅ {filename} 已上传到 CPA 管理平台")
+            return True
         else:
-            with _print_lock:
-                print(f"  [CPA] 上传失败: {resp.status_code} - {resp.text[:200]}")
+            print(f"  [CPA] ❌ {filename} 上传失败: {resp.status_code} - {resp.text[:200]}")
+            return False
     except Exception as e:
-        with _print_lock:
-            print(f"  [CPA] 上传异常: {e}")
+        print(f"  [CPA] ❌ {os.path.basename(filepath)} 上传异常: {e}")
+        return False
     finally:
         if mp:
             mp.close()
+
+
+def _upload_all_tokens_to_cpa(proxy=None):
+    """批量上传 codex_tokens 目录下所有 JSON 文件到 CPA，上传成功后删除文件"""
+    if not UPLOAD_API_URL:
+        print("\n[CPA] ⚠️ 未配置 upload_api_url，跳过 CPA 上传")
+        return
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
+
+    if not os.path.isdir(token_dir):
+        print(f"\n[CPA] ⚠️ codex_tokens 目录不存在: {token_dir}")
+        return
+
+    json_files = [f for f in os.listdir(token_dir) if f.endswith(".json")]
+    if not json_files:
+        print(f"\n[CPA] ⚠️ codex_tokens 目录下没有 JSON 文件")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  [CPA] 开始上传 {len(json_files)} 个账号到 CPA 管理平台")
+    print(f"{'='*60}")
+
+    uploaded = 0
+    failed = 0
+    for filename in json_files:
+        filepath = os.path.join(token_dir, filename)
+        if _upload_token_json(filepath, proxy=proxy):
+            try:
+                os.remove(filepath)
+                print(f"  [CPA] 🗑️ 已删除本地文件: {filename}")
+            except Exception as e:
+                print(f"  [CPA] ⚠️ 删除文件失败 {filename}: {e}")
+            uploaded += 1
+        else:
+            failed += 1
+
+    print(f"\n  [CPA] 上传完成: 成功 {uploaded} 个, 失败 {failed} 个")
+    print(f"{'='*60}")
+
+
+# ================= CPA Codex 清理引擎 (内嵌) =================
+
+from datetime import datetime as _cpa_datetime
+from concurrent.futures import Future as _cpa_Future
+from urllib.parse import urlparse as _cpa_urlparse, urlunparse as _cpa_urlunparse
+
+_CPA_STATUS_KEYWORDS = {
+    "token_invalidated",
+    "token_revoked",
+    "usage_limit_reached",
+}
+
+_CPA_MESSAGE_KEYWORDS = [
+    "额度获取失败：401",
+    '"status":401',
+    '"status": 401',
+    "your authentication token has been invalidated.",
+    "encountered invalidated oauth token for user",
+    "token_invalidated",
+    "token_revoked",
+    "usage_limit_reached",
+]
+
+_CPA_PROBE_TARGET_URL = "https://chatgpt.com/backend-api/codex/responses/compact"
+_CPA_PROBE_MODEL = "gpt-5.1-codex"
+
+
+def _cpa_normalize_api_root(raw_url):
+    value = (raw_url or "").strip()
+    if not value:
+        return ""
+    parsed = _cpa_urlparse(value)
+    path = parsed.path or ""
+    if path.endswith("/management.html"):
+        path = path[: -len("/management.html")] + "/v0/management"
+    for suffix in ("/api-call", "/auth-files"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+    normalized = _cpa_urlunparse((parsed.scheme, parsed.netloc, path.rstrip("/"), "", "", ""))
+    return normalized.rstrip("/")
+
+
+class _CpaCleanupConfig:
+    def __init__(self, management_url, management_token, management_timeout=15,
+                 active_probe=True, probe_timeout=8, probe_workers=12,
+                 delete_workers=8, max_active_probes=120):
+        self.management_url = management_url
+        self.management_token = management_token
+        self.management_timeout = management_timeout
+        self.active_probe = active_probe
+        self.probe_timeout = probe_timeout
+        self.probe_workers = probe_workers
+        self.delete_workers = delete_workers
+        self.max_active_probes = max_active_probes
+
+    @classmethod
+    def from_mapping(cls, data):
+        def to_int(name, default, minimum):
+            try:
+                parsed = int(data.get(name, default))
+            except Exception:
+                parsed = default
+            return max(minimum, parsed)
+
+        def to_bool(name, default):
+            raw = data.get(name, default)
+            if isinstance(raw, bool):
+                return raw
+            text = str(raw).strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off"}:
+                return False
+            return default
+
+        return cls(
+            management_url=_cpa_normalize_api_root(str(data.get("management_url", "") or "")),
+            management_token=str(data.get("management_token", "") or "").strip(),
+            management_timeout=to_int("management_timeout", 15, 1),
+            active_probe=to_bool("active_probe", True),
+            probe_timeout=to_int("probe_timeout", 8, 1),
+            probe_workers=to_int("probe_workers", 12, 1),
+            delete_workers=to_int("delete_workers", 8, 1),
+            max_active_probes=to_int("max_active_probes", 120, 0),
+        )
+
+    def validate(self):
+        if not self.management_url:
+            return False, "management_url 不能为空"
+        if not self.management_token:
+            return False, "management_token 不能为空"
+        if not self.management_url.startswith(("http://", "https://")):
+            return False, "management_url 必须以 http:// 或 https:// 开头"
+        return True, ""
+
+
+class _CpaManagementGateway:
+    def __init__(self, config):
+        self.config = config
+
+    @property
+    def _headers(self):
+        return {"Authorization": f"Bearer {self.config.management_token}"}
+
+    @property
+    def auth_files_endpoint(self):
+        return self.config.management_url.rstrip("/") + "/auth-files"
+
+    @property
+    def api_call_endpoint(self):
+        return self.config.management_url.rstrip("/") + "/api-call"
+
+    def list_auth_files(self):
+        resp = curl_requests.get(self.auth_files_endpoint, headers=self._headers,
+                                 timeout=self.config.management_timeout)
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"auth-files 接口不存在: {self.auth_files_endpoint} (HTTP 404). "
+                "请确认 management_url 是管理 API 根路径"
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+        files = payload.get("files", []) if isinstance(payload, dict) else []
+        return files if isinstance(files, list) else []
+
+    def delete_auth_file(self, name):
+        resp = curl_requests.delete(
+            self.auth_files_endpoint,
+            params={"name": name},
+            headers=self._headers,
+            timeout=self.config.management_timeout,
+        )
+        if 200 <= resp.status_code < 300:
+            return True, ""
+        detail = ""
+        try:
+            detail = json.dumps(resp.json(), ensure_ascii=False)
+        except Exception:
+            detail = resp.text
+        return False, f"HTTP {resp.status_code}: {detail}"
+
+    def probe_auth_index(self, auth_index):
+        payload = {
+            "auth_index": auth_index,
+            "method": "POST",
+            "url": _CPA_PROBE_TARGET_URL,
+            "header": {
+                "Authorization": "Bearer $TOKEN$",
+                "Content-Type": "application/json",
+                "User-Agent": "codex_cli_rs/0.101.0",
+            },
+            "data": json.dumps(
+                {"model": _CPA_PROBE_MODEL, "input": [{"role": "user", "content": "ping"}]},
+                ensure_ascii=False,
+            ),
+        }
+        resp = curl_requests.post(
+            self.api_call_endpoint,
+            headers=self._headers,
+            json=payload,
+            timeout=self.config.probe_timeout,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, dict):
+            return 0, ""
+        return int(body.get("status_code", 0) or 0), str(body.get("body", "") or "")
+
+
+def _cpa_safe_status_message(file_obj):
+    return str(file_obj.get("status_message", "") or "")
+
+
+def _cpa_reason_from_status(file_obj):
+    status_message = _cpa_safe_status_message(file_obj)
+    if not status_message:
+        return ""
+    lower_msg = status_message.lower()
+    for keyword in _CPA_MESSAGE_KEYWORDS:
+        if keyword in lower_msg:
+            return keyword
+    try:
+        parsed = json.loads(status_message)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        if int(parsed.get("status", 0) or 0) == 401:
+            return "status_401"
+        err = parsed.get("error", {})
+        if isinstance(err, dict):
+            code = str(err.get("code", "") or "")
+            if code in _CPA_STATUS_KEYWORDS:
+                return code
+    return ""
+
+
+def _cpa_looks_401(file_obj):
+    try:
+        if int(file_obj.get("status", 0) or 0) == 401:
+            return True
+    except Exception:
+        pass
+    text = _cpa_safe_status_message(file_obj).lower()
+    return "401" in text or "unauthorized" in text
+
+
+class _CpaCleanupOrchestrator:
+    def __init__(self, config, log=None):
+        self.config = config
+        self.gateway = _CpaManagementGateway(config)
+        self.log = log or (lambda msg: None)
+
+    def _log(self, message):
+        self.log(message)
+
+    def _probe_one(self, file_obj):
+        name = str(file_obj.get("name", "") or "")
+        auth_index = str(file_obj.get("auth_index", "") or "").strip()
+        if not auth_index:
+            return name, ""
+        try:
+            status_code, body = self.gateway.probe_auth_index(auth_index)
+        except Exception as exc:
+            return name, f"probe_error:{exc}"
+        body_lower = body.lower()
+        if status_code == 401:
+            return name, "probe_status_401"
+        if "401" in body_lower or "unauthorized" in body_lower:
+            return name, "probe_body_401"
+        for keyword in _CPA_MESSAGE_KEYWORDS:
+            if keyword in body_lower:
+                return name, f"probe_{keyword}"
+        return name, ""
+
+    def _delete_batch(self, hits):
+        deleted = 0
+        failures = []
+        total = len(hits)
+
+        def task(item):
+            ok, err = self.gateway.delete_auth_file(item["name"])
+            return item["name"], ok, err
+
+        with ThreadPoolExecutor(max_workers=self.config.delete_workers) as pool:
+            future_map = {pool.submit(task, item): item for item in hits}
+            done = 0
+            for future in as_completed(future_map):
+                done += 1
+                name, ok, err = future.result()
+                if ok:
+                    deleted += 1
+                    self._log(f"[CPA清理] 删除成功: {name} ({done}/{total})")
+                else:
+                    failures.append({"name": name, "error": err})
+                    self._log(f"[CPA清理] 删除失败: {name} -> {err}")
+        return deleted, failures
+
+    def _cleanup_401_only(self, exclude_names):
+        try:
+            files = self.gateway.list_auth_files()
+        except Exception as exc:
+            self._log(f"[CPA清理] 401补删列表读取失败: {exc}")
+            return 0, [{"name": "<list>", "error": str(exc)}]
+        targets = []
+        for file_obj in files:
+            name = str(file_obj.get("name", "") or "")
+            if not name or name in exclude_names:
+                continue
+            if _cpa_looks_401(file_obj):
+                targets.append({"name": name, "keyword": "status_401",
+                                "status_message": _cpa_safe_status_message(file_obj)})
+        if not targets:
+            self._log("[CPA清理] 401补删: 无目标")
+            return 0, []
+        self._log(f"[CPA清理] 401补删: 待删除 {len(targets)} 个")
+        deleted, failures = self._delete_batch(targets)
+        return deleted, failures
+
+    def run(self):
+        self._log("[CPA清理] 开始清理")
+        self._log(f"[CPA清理] 配置: active_probe={self.config.active_probe}, "
+                  f"probe_workers={self.config.probe_workers}, delete_workers={self.config.delete_workers}, "
+                  f"max_active_probes={self.config.max_active_probes}")
+
+        files = self.gateway.list_auth_files()
+        self._log(f"[CPA清理] 拉取 auth-files 成功，总数: {len(files)}")
+
+        fixed_hits = []
+        probe_candidates = []
+
+        for file_obj in files:
+            reason = _cpa_reason_from_status(file_obj)
+            name = str(file_obj.get("name", "") or "")
+            if not name:
+                continue
+            if reason:
+                fixed_hits.append({"name": name, "keyword": reason,
+                                   "status_message": _cpa_safe_status_message(file_obj)})
+                continue
+            provider = str(file_obj.get("provider", "") or "").strip().lower()
+            auth_index = str(file_obj.get("auth_index", "") or "").strip()
+            if self.config.active_probe and provider == "codex" and auth_index:
+                probe_candidates.append(file_obj)
+
+        if self.config.active_probe and self.config.max_active_probes > 0 and len(probe_candidates) > self.config.max_active_probes:
+            self._log(f"[CPA清理] 主动探测候选 {len(probe_candidates)}，仅探测前 {self.config.max_active_probes} 个")
+            probe_candidates = probe_candidates[: self.config.max_active_probes]
+
+        probed_hits = []
+        if self.config.active_probe and self.config.max_active_probes != 0 and probe_candidates:
+            self._log(f"[CPA清理] 开始主动探测，候选 {len(probe_candidates)} 个")
+            with ThreadPoolExecutor(max_workers=self.config.probe_workers) as pool:
+                future_map = {pool.submit(self._probe_one, item): item for item in probe_candidates}
+                done = 0
+                total = len(probe_candidates)
+                for future in as_completed(future_map):
+                    done += 1
+                    name, reason = future.result()
+                    if reason:
+                        if not reason.startswith("probe_error"):
+                            status_message = _cpa_safe_status_message(future_map[future])
+                            probed_hits.append({"name": name, "keyword": reason,
+                                                "status_message": status_message})
+                            self._log(f"[CPA清理] 探测命中: {name} -> {reason}")
+                        else:
+                            self._log(f"[CPA清理] 探测异常: {name} -> {reason}")
+                    if done % 20 == 0 or done == total:
+                        self._log(f"[CPA清理] 探测进度: {done}/{total}")
+        else:
+            self._log("[CPA清理] 主动探测已关闭或无候选")
+
+        merged_by_name = {}
+        for item in fixed_hits + probed_hits:
+            if item["name"] not in merged_by_name:
+                merged_by_name[item["name"]] = item
+
+        matched = list(merged_by_name.values())
+        self._log(f"[CPA清理] 命中删除规则: {len(matched)}")
+
+        deleted_main = 0
+        failures = []
+        if matched:
+            deleted_main, failures = self._delete_batch(matched)
+        else:
+            self._log("[CPA清理] 主流程无删除目标")
+
+        deleted_401, failures_401 = self._cleanup_401_only(set(merged_by_name.keys()))
+        failures.extend(failures_401)
+
+        result = {
+            "scanned_total": len(files),
+            "matched_total": len(matched),
+            "deleted_main": deleted_main,
+            "deleted_401": deleted_401,
+            "deleted_total": deleted_main + deleted_401,
+            "failures": failures,
+        }
+        self._log(f"[CPA清理] 完成: scanned={result['scanned_total']}, matched={result['matched_total']}, "
+                  f"deleted_main={result['deleted_main']}, deleted_401={result['deleted_401']}, "
+                  f"deleted_total={result['deleted_total']}")
+        if result["failures"]:
+            self._log(f"[CPA清理] 失败数: {len(result['failures'])}")
+        return result
+
+
+def _cpa_execute_cleanup(payload, log=None):
+    config = _CpaCleanupConfig.from_mapping(payload)
+    ok, msg = config.validate()
+    if not ok:
+        raise ValueError(msg)
+    orchestrator = _CpaCleanupOrchestrator(config=config, log=log)
+    return orchestrator.run()
+
+
+def _run_cpa_cleanup_before_register():
+    """在注册前执行 CPA 无效号清理，失败不阻断注册流程"""
+    print(f"\n{'='*60}")
+    print("  [CPA清理] 注册前清理 CPA 无效号...")
+    print(f"{'='*60}")
+    try:
+        payload = {
+            "management_url": UPLOAD_API_URL,
+            "management_token": UPLOAD_API_TOKEN,
+            "active_probe": True,
+            "probe_workers": 12,
+            "delete_workers": 8,
+            "max_active_probes": 120,
+        }
+        result = _cpa_execute_cleanup(payload, log=lambda msg: print(f"  {msg}"))
+        print(f"\n  [CPA清理] 清理完成: 扫描 {result['scanned_total']} 个, "
+              f"命中 {result['matched_total']} 个, 删除 {result['deleted_total']} 个")
+        if result["failures"]:
+            print(f"  [CPA清理] 失败: {len(result['failures'])} 个")
+    except Exception as e:
+        print(f"  [CPA清理] ⚠️ 清理失败 (不影响注册): {e}")
+        traceback.print_exc()
+    print(f"{'='*60}\n")
 
 
 def _generate_password(length=14):
@@ -633,7 +915,7 @@ def _generate_password(length=14):
 # ================= DuckMail 邮箱函数 =================
 
 def _create_duckmail_session():
-    """创建带重试的 DuckMail 请求会话"""
+    """创建 DuckMail 请求会话"""
     session = curl_requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -648,23 +930,23 @@ def create_temp_email():
     if not DUCKMAIL_BEARER:
         raise Exception("DUCKMAIL_BEARER 未设置，无法创建临时邮箱")
 
+    password = _generate_password()
+
     # 生成随机邮箱前缀 8-13 位
     chars = string.ascii_lowercase + string.digits
     length = random.randint(8, 13)
     email_local = "".join(random.choice(chars) for _ in range(length))
     email = f"{email_local}@duckmail.sbs"
-    password = _generate_password()
 
     api_base = DUCKMAIL_API_BASE.rstrip("/")
     headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
     session = _create_duckmail_session()
 
     try:
-        # 1. 创建账号
-        payload = {"address": email, "password": password}
+        # 创建账号
         res = session.post(
             f"{api_base}/accounts",
-            json=payload,
+            json={"address": email, "password": password},
             headers=headers,
             timeout=15,
             impersonate="chrome131"
@@ -673,12 +955,11 @@ def create_temp_email():
         if res.status_code not in [200, 201]:
             raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
 
-        # 2. 获取 Token（用于读取邮件）
+        # 获取 Token
         time.sleep(0.5)
-        token_payload = {"address": email, "password": password}
         token_res = session.post(
             f"{api_base}/token",
-            json=token_payload,
+            json={"address": email, "password": password},
             timeout=15,
             impersonate="chrome131"
         )
@@ -693,6 +974,12 @@ def create_temp_email():
 
     except Exception as e:
         raise Exception(f"DuckMail 创建邮箱失败: {e}")
+
+
+def delete_temp_email(mail_token: str, inbox_id: str = None):
+    """删除 DuckMail 临时邮箱 (DuckMail 不需要删除操作)"""
+    # DuckMail 临时邮箱不需要手动删除
+    return True
 
 
 def _fetch_emails_duckmail(mail_token: str):
@@ -711,11 +998,11 @@ def _fetch_emails_duckmail(mail_token: str):
 
         if res.status_code == 200:
             data = res.json()
-            # DuckMail API 返回格式可能是 hydra:member 或 member
             messages = data.get("hydra:member") or data.get("member") or data.get("data") or []
             return messages
         return []
     except Exception as e:
+        print(f"[DuckMail] fetch emails error: {e}")
         return []
 
 
@@ -726,7 +1013,6 @@ def _fetch_email_detail_duckmail(mail_token: str, msg_id: str):
         headers = {"Authorization": f"Bearer {mail_token}"}
         session = _create_duckmail_session()
 
-        # 处理 msg_id 格式
         if isinstance(msg_id, str) and msg_id.startswith("/messages/"):
             msg_id = msg_id.split("/")[-1]
 
@@ -739,19 +1025,20 @@ def _fetch_email_detail_duckmail(mail_token: str, msg_id: str):
 
         if res.status_code == 200:
             return res.json()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DuckMail] fetch detail error: {e}")
     return None
 
 
-def _extract_verification_code(email_content: str):
-    """从邮件内容提取 6 位验证码"""
-    if not email_content:
+def _extract_verification_code(email_content: str, subject: str = ""):
+    """从邮件内容或主题提取 6 位验证码"""
+    combined = f"{subject} {email_content}" if subject else email_content
+    if not combined:
         return None
 
     patterns = [
-        r"Verification code:?\s*(\d{6})",
         r"code is\s*(\d{6})",
+        r"Verification code:?\s*(\d{6})",
         r"代码为[:：]?\s*(\d{6})",
         r"验证码[:：]?\s*(\d{6})",
         r">\s*(\d{6})\s*<",
@@ -759,31 +1046,35 @@ def _extract_verification_code(email_content: str):
     ]
 
     for pattern in patterns:
-        matches = re.findall(pattern, email_content, re.IGNORECASE)
+        matches = re.findall(pattern, combined, re.IGNORECASE)
         for code in matches:
-            if code == "177010":  # 已知误判
+            if code == "177010":
                 continue
             return code
     return None
 
 
-def wait_for_verification_email(mail_token: str, timeout: int = 120):
+def wait_for_verification_email(mail_token: str, email: str = None, timeout: int = 120):
     """等待并提取 OpenAI 验证码"""
     start_time = time.time()
 
     while time.time() - start_time < timeout:
         messages = _fetch_emails_duckmail(mail_token)
-        if messages and len(messages) > 0:
-            # 获取最新邮件详情
+        if messages and isinstance(messages, list) and len(messages) > 0:
             first_msg = messages[0]
             msg_id = first_msg.get("id") or first_msg.get("@id")
+            subject = first_msg.get("subject", "")
+
+            # 先尝试从 subject 提取验证码
+            code = _extract_verification_code("", subject)
+            if code:
+                return code
 
             if msg_id:
                 detail = _fetch_email_detail_duckmail(mail_token, msg_id)
                 if detail:
-                    # DuckMail 的邮件内容在 text 或 html 字段
                     content = detail.get("text") or detail.get("html") or ""
-                    code = _extract_verification_code(content)
+                    code = _extract_verification_code(content, subject)
                     if code:
                         return code
 
@@ -872,7 +1163,7 @@ class ChatGPTRegister:
     # ==================== DuckMail 临时邮箱 ====================
 
     def _create_duckmail_session(self):
-        """创建带重试的 DuckMail 请求会话"""
+        """创建 DuckMail 请求会话"""
         session = curl_requests.Session()
         session.headers.update({
             "User-Agent": self.ua,
@@ -888,23 +1179,23 @@ class ChatGPTRegister:
         if not DUCKMAIL_BEARER:
             raise Exception("DUCKMAIL_BEARER 未设置，无法创建临时邮箱")
 
+        password = _generate_password()
+
         # 生成随机邮箱前缀 8-13 位
         chars = string.ascii_lowercase + string.digits
         length = random.randint(8, 13)
         email_local = "".join(random.choice(chars) for _ in range(length))
         email = f"{email_local}@duckmail.sbs"
-        password = _generate_password()
 
         api_base = DUCKMAIL_API_BASE.rstrip("/")
         headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
         session = self._create_duckmail_session()
 
         try:
-            # 1. 创建账号
-            payload = {"address": email, "password": password}
+            # 创建账号
             res = session.post(
                 f"{api_base}/accounts",
-                json=payload,
+                json={"address": email, "password": password},
                 headers=headers,
                 timeout=15,
                 impersonate=self.impersonate
@@ -913,12 +1204,11 @@ class ChatGPTRegister:
             if res.status_code not in [200, 201]:
                 raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
 
-            # 2. 获取 Token（用于读取邮件）
+            # 获取 Token
             time.sleep(0.5)
-            token_payload = {"address": email, "password": password}
             token_res = session.post(
                 f"{api_base}/token",
-                json=token_payload,
+                json={"address": email, "password": password},
                 timeout=15,
                 impersonate=self.impersonate
             )
@@ -934,6 +1224,10 @@ class ChatGPTRegister:
         except Exception as e:
             raise Exception(f"DuckMail 创建邮箱失败: {e}")
 
+    def delete_temp_email(self, mail_token: str, inbox_id: str = None):
+        """删除 DuckMail 临时邮箱 (DuckMail 不需要删除操作)"""
+        return True
+
     def _fetch_emails_duckmail(self, mail_token: str):
         """从 DuckMail 获取邮件列表"""
         try:
@@ -948,12 +1242,16 @@ class ChatGPTRegister:
                 impersonate=self.impersonate
             )
 
+            self._print(f"[DuckMail] GET /messages -> {res.status_code}")
+
             if res.status_code == 200:
                 data = res.json()
                 messages = data.get("hydra:member") or data.get("member") or data.get("data") or []
+                self._print(f"[DuckMail] found {len(messages) if isinstance(messages, list) else 0} messages")
                 return messages
             return []
-        except Exception:
+        except Exception as e:
+            self._print(f"[DuckMail] fetch emails error: {e}")
             return []
 
     def _fetch_email_detail_duckmail(self, mail_token: str, msg_id: str):
@@ -975,18 +1273,19 @@ class ChatGPTRegister:
 
             if res.status_code == 200:
                 return res.json()
-        except Exception:
-            pass
+        except Exception as e:
+            self._print(f"[DuckMail] fetch detail error: {e}")
         return None
 
-    def _extract_verification_code(self, email_content: str):
-        """从邮件内容提取 6 位验证码"""
-        if not email_content:
+    def _extract_verification_code(self, email_content: str, subject: str = ""):
+        """从邮件内容或主题提取 6 位验证码"""
+        combined = f"{subject} {email_content}" if subject else email_content
+        if not combined:
             return None
 
         patterns = [
-            r"Verification code:?\s*(\d{6})",
             r"code is\s*(\d{6})",
+            r"Verification code:?\s*(\d{6})",
             r"代码为[:：]?\s*(\d{6})",
             r"验证码[:：]?\s*(\d{6})",
             r">\s*(\d{6})\s*<",
@@ -994,29 +1293,36 @@ class ChatGPTRegister:
         ]
 
         for pattern in patterns:
-            matches = re.findall(pattern, email_content, re.IGNORECASE)
+            matches = re.findall(pattern, combined, re.IGNORECASE)
             for code in matches:
-                if code == "177010":  # 已知误判
+                if code == "177010":
                     continue
                 return code
         return None
 
-    def wait_for_verification_email(self, mail_token: str, timeout: int = 120):
+    def wait_for_verification_email(self, mail_token: str, email: str = None, timeout: int = 120):
         """等待并提取 OpenAI 验证码"""
         self._print(f"[OTP] 等待验证码邮件 (最多 {timeout}s)...")
         start_time = time.time()
 
         while time.time() - start_time < timeout:
             messages = self._fetch_emails_duckmail(mail_token)
-            if messages and len(messages) > 0:
+            if messages and isinstance(messages, list) and len(messages) > 0:
                 first_msg = messages[0]
                 msg_id = first_msg.get("id") or first_msg.get("@id")
+                subject = first_msg.get("subject", "")
+
+                # 先尝试从 subject 提取验证码
+                code = self._extract_verification_code("", subject)
+                if code:
+                    self._print(f"[OTP] 验证码(从主题): {code}")
+                    return code
 
                 if msg_id:
                     detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
                     if detail:
                         content = detail.get("text") or detail.get("html") or ""
-                        code = self._extract_verification_code(content)
+                        code = self._extract_verification_code(content, subject)
                         if code:
                             self._print(f"[OTP] 验证码: {code}")
                             return code
@@ -1189,7 +1495,7 @@ class ChatGPTRegister:
 
         if need_otp:
             # 使用 DuckMail 等待验证码
-            otp_code = self.wait_for_verification_email(mail_token)
+            otp_code = self.wait_for_verification_email(mail_token, email)
             if not otp_code:
                 raise Exception("未能获取验证码")
 
@@ -1199,7 +1505,7 @@ class ChatGPTRegister:
                 self._print("验证码失败，重试...")
                 self.send_otp()
                 _random_delay(1.0, 2.0)
-                otp_code = self.wait_for_verification_email(mail_token, timeout=60)
+                otp_code = self.wait_for_verification_email(mail_token, email, timeout=60)
                 if not otp_code:
                     raise Exception("重试后仍未获取验证码")
                 _random_delay(0.3, 0.8)
@@ -1710,13 +2016,23 @@ class ChatGPTRegister:
 
                 for msg in messages[:12]:
                     msg_id = msg.get("id") or msg.get("@id")
+                    subject = msg.get("subject", "")
+                    self._print(f"[OAuth] msg subject: {subject}")
+
+                    # 先尝试从 subject 提取验证码
+                    code = self._extract_verification_code("", subject)
+                    self._print(f"[OAuth] extracted code from subject: {code}")
+                    if code and code not in tried_codes:
+                        candidate_codes.append(code)
+                        continue
+
                     if not msg_id:
                         continue
                     detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
                     if not detail:
                         continue
                     content = detail.get("text") or detail.get("html") or ""
-                    code = self._extract_verification_code(content)
+                    code = self._extract_verification_code(content, subject)
                     if code and code not in tried_codes:
                         candidate_codes.append(code)
 
@@ -1846,6 +2162,9 @@ class ChatGPTRegister:
 def _register_one(idx, total, proxy, output_file):
     """单个注册任务 (在线程中运行) - 使用 DuckMail 临时邮箱"""
     reg = None
+    mail_token = None
+    email = None
+
     try:
         reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}")
 
@@ -1892,6 +2211,7 @@ def _register_one(idx, total, proxy, output_file):
 
         with _print_lock:
             print(f"\n[OK] [{tag}] {email} 注册成功!")
+
         return True, email, None
 
     except Exception as e:
@@ -1899,11 +2219,12 @@ def _register_one(idx, total, proxy, output_file):
         with _print_lock:
             print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
             traceback.print_exc()
+
         return False, None, error_msg
 
 
 def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
-              max_workers=3, proxy=None):
+              max_workers=3, proxy=None, cpa_cleanup=None):
     """并发批量注册 - DuckMail 临时邮箱版"""
 
     if not DUCKMAIL_BEARER:
@@ -1924,6 +2245,11 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         print(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
     print(f"  输出文件: {output_file}")
     print(f"{'#'*60}\n")
+
+    # 注册前清理 CPA 无效号
+    do_cleanup = cpa_cleanup if cpa_cleanup is not None else CPA_CLEANUP_ENABLED
+    if do_cleanup and UPLOAD_API_URL:
+        _run_cpa_cleanup_before_register()
 
     success_count = 0
     fail_count = 0
@@ -1961,16 +2287,15 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         print(f"  结果文件: {output_file}")
     print(f"{'#'*60}")
 
+    # 注册流程结束后，自动上传到 CPA 并清理
+    if success_count > 0:
+        _upload_all_tokens_to_cpa(proxy=proxy)
+
 
 def main():
-    # 增加运行次数计数器
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    current_run = _increment_run_number(base_dir)
-    
     print("=" * 60)
     print("  ChatGPT 批量自动注册工具 (DuckMail 临时邮箱版)")
     print("=" * 60)
-    print(f"[Info] 当前运行次数: {current_run}")
 
     # 检查 DuckMail 配置
     if not DUCKMAIL_BEARER:
@@ -1981,34 +2306,49 @@ def main():
         print("\n   按 Enter 继续尝试运行 (可能会失败)...")
         input()
 
-    # 代理配置（自动使用默认/环境变量代理）
+    # 交互式代理配置
     proxy = DEFAULT_PROXY
     if proxy:
         print(f"[Info] 检测到默认代理: {proxy}")
+        use_default = input("使用此代理? (Y/n): ").strip().lower()
+        if use_default == "n":
+            proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
     else:
         env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
                  or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
         if env_proxy:
             print(f"[Info] 检测到环境变量代理: {env_proxy}")
-            proxy = env_proxy
+            use_env = input("使用此代理? (Y/n): ").strip().lower()
+            if use_env == "n":
+                proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
+            else:
+                proxy = env_proxy
+        else:
+            proxy = input("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理): ").strip() or None
 
     if proxy:
         print(f"[Info] 使用代理: {proxy}")
     else:
         print("[Info] 不使用代理")
 
-    # 注册数量与并发数（固定默认值）
-    total_accounts = DEFAULT_TOTAL_ACCOUNTS
-    max_workers = 1
+    # 注册前是否清理 CPA 无效号
+    cpa_cleanup = True
+    if UPLOAD_API_URL:
+        cleanup_input = input("\n注册前清理 CPA 无效号? (Y/n): ").strip().lower()
+        cpa_cleanup = cleanup_input != "n"
+    else:
+        cpa_cleanup = False
+
+    # 输入注册数量
+    count_input = input(f"\n注册账号数量 (默认 {DEFAULT_TOTAL_ACCOUNTS}): ").strip()
+    total_accounts = int(count_input) if count_input.isdigit() and int(count_input) > 0 else DEFAULT_TOTAL_ACCOUNTS
+
+    workers_input = input("并发数 (默认 3): ").strip()
+    max_workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 3
 
     run_batch(total_accounts=total_accounts, output_file=DEFAULT_OUTPUT_FILE,
-              max_workers=max_workers, proxy=proxy)
+              max_workers=max_workers, proxy=proxy, cpa_cleanup=cpa_cleanup)
 
 
 if __name__ == "__main__":
-    import random
-    import time
-    # delay = random.randint(1, 600)
-    # print(f"[Info] 随机延迟 {delay} 秒后开始执行...")
-    # time.sleep(delay)
     main()
