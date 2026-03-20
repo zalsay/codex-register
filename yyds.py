@@ -483,11 +483,11 @@ def _upload_all_tokens_to_cpa(proxy=None):
     for filename in json_files:
         filepath = os.path.join(token_dir, filename)
         if _upload_token_json(filepath, proxy=proxy):
-            try:
-                os.remove(filepath)
-                print(f"  [CPA] 🗑️ 已删除本地文件: {filename}")
-            except Exception as e:
-                print(f"  [CPA] ⚠️ 删除文件失败 {filename}: {e}")
+            # try:
+            #     os.remove(filepath)
+            #     print(f"  [CPA] 🗑️ 已删除本地文件: {filename}")
+            # except Exception as e:
+            #     print(f"  [CPA] ⚠️ 删除文件失败 {filename}: {e}")
             uploaded += 1
         else:
             failed += 1
@@ -2403,19 +2403,19 @@ def main():
     proxy = DEFAULT_PROXY
     if proxy:
         print(f"[Info] 检测到默认代理: {proxy}")
-        use_default = input("使用此代理? (Y/n): ").strip().lower()
-        if use_default == "n":
-            proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
+        # use_default = input("使用此代理? (Y/n): ").strip().lower()
+        # if use_default == "n":
+        #     proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
     else:
         env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
                  or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
         if env_proxy:
             print(f"[Info] 检测到环境变量代理: {env_proxy}")
-            use_env = input("使用此代理? (Y/n): ").strip().lower()
-            if use_env == "n":
-                proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
-            else:
-                proxy = env_proxy
+            # use_env = input("使用此代理? (Y/n): ").strip().lower()
+            # if use_env == "n":
+            #     proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
+            # else:
+            proxy = env_proxy
         else:
             proxy = input("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理): ").strip() or None
 
@@ -2424,24 +2424,19 @@ def main():
     else:
         print("[Info] 不使用代理")
 
-    # 注册前是否清理 CPA 无效号
-    cpa_cleanup = True
-    if UPLOAD_API_URL:
-        cleanup_input = input("\n注册前清理 CPA 无效号? (Y/n): ").strip().lower()
-        cpa_cleanup = cleanup_input != "n"
-    else:
-        cpa_cleanup = False
+    # 注册前是否清理 CPA 无效号（直接使用配置）
+    cpa_cleanup = CPA_CLEANUP_ENABLED if UPLOAD_API_URL else False
 
-    # 输入注册数量
-    count_input = input(f"\n注册账号数量 (默认 {DEFAULT_TOTAL_ACCOUNTS}): ").strip()
-    total_accounts = int(count_input) if count_input.isdigit() and int(count_input) > 0 else DEFAULT_TOTAL_ACCOUNTS
-
-    workers_input = input("并发数 (默认 3): ").strip()
-    max_workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 3
+    # 注册账号数量和并发数（直接使用默认值）
+    total_accounts = DEFAULT_TOTAL_ACCOUNTS
+    max_workers = 1
 
     run_batch(total_accounts=total_accounts, output_file=DEFAULT_OUTPUT_FILE,
               max_workers=max_workers, proxy=proxy, cpa_cleanup=cpa_cleanup)
 
 
 if __name__ == "__main__":
-    main()
+    import time
+    while True:
+        main()
+        time.sleep(10)

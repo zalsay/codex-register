@@ -13,6 +13,6 @@
   "ak_file": "ak.txt",
   "rk_file": "rk.txt",
   "token_json_dir": "yyds_tokens",
-  "upload_api_url": "http://localhost:8317/v0/management/auth-files",
-  "upload_api_token": "963852741"
+  "upload_api_url": "http://ts.meetlife.top:8318/v0/management/auth-files",
+  "upload_api_token": "Cqlzy@1277"
 }
