@@ -457,7 +457,7 @@ def _upload_token_json(filepath, proxy=None):
 
 
 def _upload_all_tokens_to_cpa(proxy=None):
-    """批量上传 codex_tokens 目录下所有 JSON 文件到 CPA，上传成功后删除文件"""
+    """批量上传 codex_tokens 目录下所有 JSON 文件到 CPA，保存到子目录并从子目录上传"""
     if not UPLOAD_API_URL:
         print("\n[CPA] ⚠️ 未配置 upload_api_url，跳过 CPA 上传")
         return
@@ -474,25 +474,34 @@ def _upload_all_tokens_to_cpa(proxy=None):
         print(f"\n[CPA] ⚠️ codex_tokens 目录下没有 JSON 文件")
         return
 
+    # 创建带时间戳的子目录
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sub_dir = os.path.join(token_dir, f"upload_{timestamp}")
+    os.makedirs(sub_dir, exist_ok=True)
+
+    # 移动文件到子目录
+    for filename in json_files:
+        src_path = os.path.join(token_dir, filename)
+        dst_path = os.path.join(sub_dir, filename)
+        os.rename(src_path, dst_path)
+
     print(f"\n{'='*60}")
     print(f"  [CPA] 开始上传 {len(json_files)} 个账号到 CPA 管理平台")
+    print(f"  [CPA] 从子目录上传: {sub_dir}")
     print(f"{'='*60}")
 
     uploaded = 0
     failed = 0
     for filename in json_files:
-        filepath = os.path.join(token_dir, filename)
+        filepath = os.path.join(sub_dir, filename)
         if _upload_token_json(filepath, proxy=proxy):
-            # try:
-            #     os.remove(filepath)
-            #     print(f"  [CPA] 🗑️ 已删除本地文件: {filename}")
-            # except Exception as e:
-            #     print(f"  [CPA] ⚠️ 删除文件失败 {filename}: {e}")
             uploaded += 1
         else:
             failed += 1
 
     print(f"\n  [CPA] 上传完成: 成功 {uploaded} 个, 失败 {failed} 个")
+    print(f"  [CPA] 上传目录已保留: {sub_dir}")
     print(f"{'='*60}")
 
 
