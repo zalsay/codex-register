@@ -10,7 +10,7 @@ import urllib.request
 import urllib.error
 
 # ============ 配置参数 ============
-API_BASE = "http://ts.meetlife.top:8318/v1"  # API 地址
+API_BASE = "http://ts.meetlife.top:8317/v1"  # API 地址
 API_KEY = "sk-CJjRBm1rOkCOg3IYQ"  # API Key
 MODEL = "gpt-5.4"  # 模型名称
 PROXY = ""  # 代理地址 (如 http://127.0.0.1:7890)
