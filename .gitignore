@@ -8,3 +8,5 @@ registered_accounts.txt
 run_counter.json
 
 yyds_tokens/
+
+*.json
