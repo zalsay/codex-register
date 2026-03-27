@@ -8,7 +8,7 @@ Token Atlas API 工具
 
 重构说明：
 - 获取队列：负责创建/恢复 request，并轮询等待进入可下载状态
-- 下载队列：负责消费已完成 request 里的 token 下载任务，并按需上传到 CPA
+- 下载队列：负责消费已完成 request 里的 token 下载任务，并按需保存到本地指定目录
 - 同步/异步协同：HTTP 请求仍复用同步 urllib/curl_cffi，整体由 asyncio 队列统一调度
 """
 
@@ -45,8 +45,7 @@ def load_env() -> dict[str, str]:
 env_config = load_env()
 SESSION_COOKIE = env_config.get("TOKEN_ATLAS_SESSION", "")
 API_KEY = env_config.get("TOKEN_ATLAS_API_KEY", "")
-CPA_UPLOAD_API_URL = env_config.get("CPA_UPLOAD_API_URL", "")
-CPA_UPLOAD_API_TOKEN = env_config.get("CPA_UPLOAD_API_TOKEN", "")
+TOKEN_SAVE_DIR = env_config.get("TOKEN_SAVE_DIR", "")
 POLL_INTERVAL_SECONDS = int(env_config.get("TOKEN_ATLAS_POLL_INTERVAL_SECONDS", "30"))
 POLL_MAX_ATTEMPTS = int(env_config.get("TOKEN_ATLAS_POLL_MAX_ATTEMPTS", "20"))
 DOWNLOAD_CONCURRENCY = max(1, int(env_config.get("TOKEN_ATLAS_DOWNLOAD_CONCURRENCY", "3")))
@@ -359,53 +358,34 @@ def request_is_fully_processed(request_id: str) -> bool:
             return False
         if not token_record.get("downloaded"):
             return False
-        if CPA_UPLOAD_API_URL and not token_record.get("uploaded_to_cpa"):
+        if TOKEN_SAVE_DIR and not token_record.get("saved_to_local"):
             return False
     return True
 
 
-# ============ CPA 上传 ============
-def upload_to_cpa(filepath: str | Path) -> bool:
-    """上传 JSON 文件到 CPA 管理平台"""
-    if not CPA_UPLOAD_API_URL:
-        print("[CPA] ⚠️ 未配置 CPA_UPLOAD_API_URL，跳过上传")
+# ============ 本地保存 ============
+def save_to_local(filepath: str | Path) -> bool:
+    """复制 JSON 文件到 TOKEN_SAVE_DIR 指定的本地目录"""
+    if not TOKEN_SAVE_DIR:
+        print("[Save] ⚠️ 未配置 TOKEN_SAVE_DIR，跳过保存")
         return False
 
-    mp = None
+    src = Path(filepath)
+    if not src.exists():
+        print(f"[Save] ❌ 源文件不存在: {src}")
+        return False
+
+    dest_dir = Path(TOKEN_SAVE_DIR)
     try:
-        from curl_cffi import CurlMime  # pyright: ignore[reportMissingImports]
-        from curl_cffi.requests import Session as CurlSession  # pyright: ignore[reportMissingImports]
-
-        filename = Path(filepath).name
-        mp = CurlMime()
-        mp.addpart(
-            name="file",
-            content_type="application/json",
-            filename=filename,
-            local_path=str(filepath),
-        )
-        session = CurlSession()
-        resp = session.post(
-            CPA_UPLOAD_API_URL,
-            multipart=mp,
-            headers={"Authorization": f"Bearer {CPA_UPLOAD_API_TOKEN}"},
-            verify=False,
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            print(f"[CPA] ✅ {filename} 已上传到 CPA 管理平台")
-            return True
-        print(f"[CPA] ❌ {filename} 上传失败: {resp.status_code} - {resp.text[:200]}")
-        return False
-    except ImportError:
-        print("[CPA] ⚠️ 需要安装 curl_cffi: pip install curl_cffi")
-        return False
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / src.name
+        import shutil
+        shutil.copy2(src, dest_path)
+        print(f"[Save] ✅ {src.name} 已保存到 {dest_path}")
+        return True
     except Exception as e:
-        print(f"[CPA] ❌ {Path(filepath).name} 上传异常: {e}")
+        print(f"[Save] ❌ {src.name} 保存失败: {e}")
         return False
-    finally:
-        if mp:
-            mp.close()
 
 
 # ============ 工具函数 ============
@@ -650,25 +630,25 @@ async def download_worker(download_queue: asyncio.Queue[dict[str, Any]]) -> None
                     token_file_path = saved_path
 
                 token_record = await asyncio.to_thread(get_token_record, request_id, token_id)
-                already_uploaded = bool(token_record and token_record.get("uploaded_to_cpa"))
-                if CPA_UPLOAD_API_URL and token_file_path and token_file_path.exists():
-                    if already_uploaded:
-                        print(f"[Skip] request_id={request_id}, token={token_id} 已上传到 CPA")
+                already_saved = bool(token_record and token_record.get("saved_to_local"))
+                if TOKEN_SAVE_DIR and token_file_path and token_file_path.exists():
+                    if already_saved:
+                        print(f"[Skip] request_id={request_id}, token={token_id} 已保存到本地")
                     else:
-                        uploaded = await asyncio.to_thread(upload_to_cpa, token_file_path)
-                        if uploaded:
+                        saved = await asyncio.to_thread(save_to_local, token_file_path)
+                        if saved:
                             await asyncio.to_thread(
                                 update_token_record,
                                 request_id,
                                 token_id,
                                 {
-                                    "uploaded_to_cpa": True,
-                                    "uploaded_to_cpa_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    "status": "uploaded",
+                                    "saved_to_local": True,
+                                    "saved_to_local_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "status": "saved",
                                 },
                             )
                         else:
-                            print(f"[CPA] request_id={request_id}, token={token_id} 上传失败，保留历史等待重试")
+                            print(f"[Save] request_id={request_id}, token={token_id} 保存失败，保留历史等待重试")
 
             if await asyncio.to_thread(request_is_fully_processed, request_id):
                 await asyncio.to_thread(remove_request_record, request_id)
@@ -676,11 +656,11 @@ async def download_worker(download_queue: asyncio.Queue[dict[str, Any]]) -> None
             download_queue.task_done()
 
 
-async def upload_history_snapshot_if_needed() -> None:
-    """按需上传当前历史文件快照"""
-    if CPA_UPLOAD_API_URL and HISTORY_FILE.exists():
-        print("\n[CPA] 开始上传历史记录到 CPA...")
-        await asyncio.to_thread(upload_to_cpa, HISTORY_FILE)
+async def save_history_snapshot_if_needed() -> None:
+    """按需保存当前历史文件快照到 TOKEN_SAVE_DIR"""
+    if TOKEN_SAVE_DIR and HISTORY_FILE.exists():
+        print("\n[Save] 开始保存历史记录到本地...")
+        await asyncio.to_thread(save_to_local, HISTORY_FILE)
 
 
 async def async_main() -> None:
@@ -726,7 +706,7 @@ async def async_main() -> None:
     try:
         await fetch_queue.join()
         await download_queue.join()
-        await upload_history_snapshot_if_needed()
+        await save_history_snapshot_if_needed()
     finally:
         fetch_task.cancel()
         for task in download_tasks:
