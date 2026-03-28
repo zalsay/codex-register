@@ -10,3 +10,4 @@ run_counter.json
 yyds_tokens/
 
 *.json
+chat_test.py

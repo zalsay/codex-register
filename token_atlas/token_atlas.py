@@ -690,13 +690,10 @@ async def async_main() -> None:
 
     for req in downloadable_requests:
         request_id = req.get("request_id")
-        if request_id:
-            items = req.get("items", [])
+        items = req.get("items", [])
+        if request_id and items:
             print(f"[Resume] 恢复可下载请求: request_id={request_id}, items={len(items)}")
             await download_queue.put({"request_id": request_id, "items": items})
-
-    if fetch_queue.empty() and download_queue.empty():
-        await create_new_claim_if_needed(fetch_queue, queued_request_ids)
 
     fetch_task = asyncio.create_task(fetch_worker(fetch_queue, download_queue, queued_request_ids))
     download_tasks = [
@@ -704,6 +701,33 @@ async def async_main() -> None:
     ]
 
     try:
+        while True:
+            if fetch_queue.empty() and download_queue.empty() and not queued_request_ids:
+                pending_requests = await asyncio.to_thread(find_pending_requests)
+                downloadable_requests = await asyncio.to_thread(find_downloadable_requests)
+
+                for req in pending_requests:
+                    request_id = req.get("request_id")
+                    if request_id:
+                        print(f"[Resume] 恢复等待中的请求: request_id={request_id}, status={req.get('status')}")
+                        enqueue_request_if_needed(request_id, req, fetch_queue, queued_request_ids)
+
+                for req in downloadable_requests:
+                    request_id = req.get("request_id")
+                    items = req.get("items", [])
+                    if request_id and items and not await asyncio.to_thread(request_is_fully_processed, request_id):
+                        print(f"[Resume] 恢复可下载请求: request_id={request_id}, items={len(items)}")
+                        await download_queue.put({"request_id": request_id, "items": items})
+
+                if fetch_queue.empty() and download_queue.empty() and not queued_request_ids:
+                    _, quota_remaining = await fetch_me_quota("[Loop /me]")
+                    if quota_remaining <= 0:
+                        print("[Info] 当前没有可申请额度，结束本轮运行")
+                        break
+                    await create_new_claim_if_needed(fetch_queue, queued_request_ids)
+
+            await asyncio.sleep(1)
+
         await fetch_queue.join()
         await download_queue.join()
         await save_history_snapshot_if_needed()
