@@ -94,6 +94,12 @@ type TokenRecord struct {
 	UpdatedAt      string `json:"updated_at,omitempty"`
 }
 
+type DownloadedTokenFile struct {
+	FileName string `json:"file_name,omitempty"`
+	FilePath string `json:"file_path,omitempty"`
+}
+
+
 type FetchJob struct {
 	RequestID string
 	Payload   map[string]any
@@ -332,7 +338,9 @@ func (a *App) downloadWorker(ctx context.Context, downloadQueue <-chan DownloadJ
 						fmt.Printf("[Download] request_id=%s, token=%s 下载失败，保留历史等待下次续跑: %v\n", job.RequestID, tokenID, err)
 						continue
 					}
-					savedPath, err := saveJSON(a.cfg.SaveDir, tokenData, fmt.Sprintf("token_%s", tokenID))
+					downloadedFile := extractDownloadedTokenFile(tokenData)
+					desiredFileName := normalizeJSONFileName(downloadedFile.FileName, fmt.Sprintf("token_%s.json", tokenID))
+					savedPath, err := saveJSONWithName(a.cfg.SaveDir, tokenData, desiredFileName)
 					if err != nil {
 						fmt.Printf("[Save] request_id=%s, token=%s 写文件失败: %v\n", job.RequestID, tokenID, err)
 						continue
@@ -639,26 +647,27 @@ func (c *APIClient) requestJSON(ctx context.Context, method, endpoint string, bo
 	if useSession && c.cfg.SessionCookie != "" {
 		headers["Cookie"] = fmt.Sprintf("token_atlas_session=%s", c.cfg.SessionCookie)
 	}
-	fmt.Printf("[HTTP Debug] preparing request method=%s endpoint=%s timeout=%s apiKey=%t session=%t verifySSL=%t headers=%v\n",
-		method,
-		endpoint,
-		30*time.Second,
-		useAPIKey,
-		useSession,
-		c.cfg.VerifySSL,
-		maskedHeaders(headers),
-	)
-	if body != nil {
-		payload, _ := json.Marshal(body)
-		fmt.Printf("[HTTP Debug] request body endpoint=%s body=%s\n", endpoint, shortBody(payload, 300))
-	}
 	respBody, status, err := c.do(ctx, method, url, headers, body, 30*time.Second, "[Warning] SSL 证书校验失败，尝试关闭校验后重试")
 	if err != nil {
-		fmt.Printf("[HTTP Debug] request failed method=%s endpoint=%s err=%T %v kind=%s\n", method, endpoint, err, err, classifyNetworkError(err))
+		fmt.Printf("[HTTP Debug] request failed method=%s endpoint=%s timeout=%s apiKey=%t session=%t verifySSL=%t headers=%v err=%T %v kind=%s\n",
+			method,
+			endpoint,
+			30*time.Second,
+			useAPIKey,
+			useSession,
+			c.cfg.VerifySSL,
+			maskedHeaders(headers),
+			err,
+			err,
+			classifyNetworkError(err),
+		)
+		if body != nil {
+			payload, _ := json.Marshal(body)
+			fmt.Printf("[HTTP Debug] request body endpoint=%s body=%s\n", endpoint, shortBody(payload, 300))
+		}
 		return nil, err
 	}
 	fmt.Printf("[HTTP] %s %s -> %d\n", method, endpoint, status)
-	fmt.Printf("[HTTP Debug] response snippet endpoint=%s body=%s\n", endpoint, shortBody(respBody, 500))
 	var result map[string]any
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("响应 JSON 解析失败: %w", err)
@@ -669,7 +678,6 @@ func (c *APIClient) requestJSON(ctx context.Context, method, endpoint string, bo
 func (c *APIClient) do(ctx context.Context, method, url string, headers map[string]string, body map[string]any, timeout time.Duration, fallbackMessage string) ([]byte, int, error) {
 	client := c.httpClient
 	client.Timeout = timeout
-	fmt.Printf("[HTTP Debug] dispatch primary client method=%s url=%s timeout=%s\n", method, url, timeout)
 	respBody, status, err := doRequest(ctx, client, method, url, headers, body)
 	if err == nil {
 		return respBody, status, nil
@@ -679,7 +687,6 @@ func (c *APIClient) do(ctx context.Context, method, url string, headers map[stri
 	if errors.As(err, &urlErr) && c.cfg.VerifySSL {
 		fmt.Println(fallbackMessage)
 		c.fallbackClient.Timeout = timeout
-		fmt.Printf("[HTTP Debug] dispatch fallback client method=%s url=%s timeout=%s verifySSL=false\n", method, url, timeout)
 		respBody, status, fallbackErr := doRequest(ctx, c.fallbackClient, method, url, headers, body)
 		if fallbackErr == nil {
 			fmt.Printf("[HTTP] %s %s -> %d (SSL verify disabled)\n", method, strings.TrimPrefix(url, c.cfg.APIBase), status)
@@ -714,7 +721,6 @@ func doRequest(ctx context.Context, client *http.Client, method, url string, hea
 		req.Header.Set(k, v)
 	}
 	start := time.Now()
-	fmt.Printf("[HTTP Debug] sending request method=%s host=%s path=%s contentLength=%d\n", method, req.URL.Host, req.URL.Path, req.ContentLength)
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("[HTTP Debug] client.Do failed method=%s host=%s path=%s elapsed=%s err=%T %v kind=%s\n", method, req.URL.Host, req.URL.Path, time.Since(start), err, err, classifyNetworkError(err))
@@ -724,26 +730,18 @@ func doRequest(ctx context.Context, client *http.Client, method, url string, hea
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	fmt.Printf("[HTTP Debug] response headers received method=%s path=%s status=%d elapsed=%s contentLength=%d server=%s cfRay=%s\n",
-		method,
-		req.URL.Path,
-		resp.StatusCode,
-		time.Since(start),
-		resp.ContentLength,
-		resp.Header.Get("Server"),
-		resp.Header.Get("Cf-Ray"),
-	)
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("[HTTP Debug] read body failed method=%s path=%s elapsed=%s err=%T %v kind=%s\n", method, req.URL.Path, time.Since(start), err, err, classifyNetworkError(err))
 		return nil, 0, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		fmt.Printf("[HTTP Debug] non-2xx response method=%s path=%s status=%d body=%s\n", method, req.URL.Path, resp.StatusCode, shortBody(respBody, 500))
+		fmt.Printf("[HTTP Debug] non-2xx response method=%s path=%s status=%d elapsed=%s server=%s cfRay=%s body=%s\n", method, req.URL.Path, resp.StatusCode, time.Since(start), resp.Header.Get("Server"), resp.Header.Get("Cf-Ray"), shortBody(respBody, 500))
 		return nil, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	return respBody, resp.StatusCode, nil
 }
+
 
 func (c *APIClient) GetMe(ctx context.Context) (map[string]any, error) {
 	if c.cfg.SessionCookie != "" {
@@ -1122,8 +1120,31 @@ func extractMeQuota(data map[string]any) (int, int, int) {
 	return max(0, used), max(0, limit), max(0, remaining)
 }
 
-func saveJSON(saveDir string, data map[string]any, filename string) (string, error) {
-	path := filepath.Join(saveDir, fmt.Sprintf("%s_%s.json", filename, time.Now().Format("20060102_150405")))
+func extractDownloadedTokenFile(data map[string]any) DownloadedTokenFile {
+	result := DownloadedTokenFile{}
+	if fileName, ok := data["file_name"].(string); ok {
+		result.FileName = strings.TrimSpace(fileName)
+	}
+	if filePath, ok := data["file_path"].(string); ok {
+		result.FilePath = strings.TrimSpace(filePath)
+	}
+	return result
+}
+
+func normalizeJSONFileName(fileName string, fallback string) string {
+	name := strings.TrimSpace(fileName)
+	if name == "" {
+		return fallback
+	}
+	name = filepath.Base(name)
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		return fallback
+	}
+	return name
+}
+
+func saveJSONWithName(saveDir string, data map[string]any, fileName string) (string, error) {
+	path := filepath.Join(saveDir, normalizeJSONFileName(fileName, fmt.Sprintf("token_%s.json", time.Now().Format("20060102_150405"))))
 	content, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return "", err
@@ -1131,8 +1152,12 @@ func saveJSON(saveDir string, data map[string]any, filename string) (string, err
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		return "", err
 	}
-	fmt.Printf("[Saved] %s\n", path)
+	// fmt.Printf("[Saved] %s\n", path)
 	return path, nil
+}
+
+func saveJSON(saveDir string, data map[string]any, filename string) (string, error) {
+	return saveJSONWithName(saveDir, data, fmt.Sprintf("%s_%s.json", filename, time.Now().Format("20060102_150405")))
 }
 
 func saveJSONFixed(saveDir string, data map[string]any, filename string) error {
@@ -1144,7 +1169,7 @@ func saveJSONFixed(saveDir string, data map[string]any, filename string) error {
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("[Saved] %s\n", path)
+	// fmt.Printf("[Saved] %s\n", path)
 	return nil
 }
 

@@ -42,8 +42,9 @@ stop_atlas() {
 
 start_atlas_binary() {
     if [ ! -x "${ATLAS_BIN}" ]; then
-        echo "Atlas binary not found, building it first..."
-        make -C token_atlas build
+        echo "Atlas binary not found: ${ATLAS_BIN}"
+        echo "Please build it first: make -C token_atlas build"
+        exit 1
     fi
 
     echo "Starting atlas..."
