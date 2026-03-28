@@ -511,11 +511,21 @@ func loadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	saveDir := filepath.Dir(exePath)
-	if wd, err := os.Getwd(); err == nil {
-		saveDir = wd
+	exeDir := filepath.Dir(exePath)
+	saveDir := exeDir
+	envFile := filepath.Join(exeDir, ".env")
+	if _, err := os.Stat(envFile); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return Config{}, err
+		}
+		if wd, wdErr := os.Getwd(); wdErr == nil {
+			fallbackEnv := filepath.Join(wd, ".env")
+			if _, statErr := os.Stat(fallbackEnv); statErr == nil {
+				envFile = fallbackEnv
+				saveDir = wd
+			}
+		}
 	}
-	envFile := filepath.Join(saveDir, ".env")
 	env, err := loadEnvFile(envFile)
 	if err != nil {
 		return Config{}, err

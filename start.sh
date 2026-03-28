@@ -3,7 +3,9 @@ set -e
 
 cd "$(dirname "$0")"
 
-ATLAS_BIN="token_atlas/dist/token-atlas"
+ATLAS_BIN_DIR="token_atlas/dist"
+ATLAS_BIN_NAME="token-atlas"
+ATLAS_BIN_DEFAULT="${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}"
 ATLAS_PYTHON_SCRIPT="token_atlas/token_atlas.py"
 
 # 初始化虚拟环境
@@ -33,23 +35,51 @@ start_script() {
     echo "${script_name} started, log: ${script_name}.log"
 }
 
+resolve_atlas_bin() {
+    local candidates=(
+        "${ATLAS_BIN_DEFAULT}"
+        "${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}-darwin-arm64"
+        "${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}-darwin-amd64"
+        "${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}-linux-amd64"
+    )
+
+    for bin in "${candidates[@]}"; do
+        if [ -x "${bin}" ]; then
+            printf '%s\n' "${bin}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 stop_atlas() {
     echo "Stopping atlas..."
     pkill -f "python3 ${ATLAS_PYTHON_SCRIPT}" 2>/dev/null || true
     pkill -f "python ${ATLAS_PYTHON_SCRIPT}" 2>/dev/null || true
-    pkill -f "${ATLAS_BIN}" 2>/dev/null || true
+    pkill -f "${ATLAS_BIN_DEFAULT}" 2>/dev/null || true
+    pkill -f "${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}-darwin-arm64" 2>/dev/null || true
+    pkill -f "${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}-darwin-amd64" 2>/dev/null || true
+    pkill -f "${ATLAS_BIN_DIR}/${ATLAS_BIN_NAME}-linux-amd64" 2>/dev/null || true
 }
 
 start_atlas_binary() {
-    if [ ! -x "${ATLAS_BIN}" ]; then
-        echo "Atlas binary not found: ${ATLAS_BIN}"
+    local atlas_bin
+    local atlas_dir
+    local atlas_log
+    if ! atlas_bin="$(resolve_atlas_bin)"; then
+        echo "Atlas binary not found in: ${ATLAS_BIN_DIR}"
         echo "Please build it first: make -C token_atlas build"
+        echo "Or for Apple Silicon: make -C token_atlas darwin-arm64"
         exit 1
     fi
 
-    echo "Starting atlas..."
-    nohup "$(pwd)/${ATLAS_BIN}" >> "atlas.log" 2>&1 &
-    echo "atlas started, log: atlas.log"
+    atlas_dir="$(dirname "${atlas_bin}")"
+    atlas_log="${atlas_dir}/atlas.log"
+
+    echo "Starting atlas with ${atlas_bin}..."
+    nohup "$(pwd)/${atlas_bin}" >> "${atlas_log}" 2>&1 &
+    echo "atlas started, log: ${atlas_log}"
 }
 
 case "$1" in
