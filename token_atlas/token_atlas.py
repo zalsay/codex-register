@@ -9,18 +9,20 @@ Token Atlas API 工具
 重构说明：
 - 获取队列：负责创建/恢复 request，并轮询等待进入可下载状态
 - 下载队列：负责消费已完成 request 里的 token 下载任务，并按需保存到本地指定目录
-- 同步/异步协同：HTTP 请求仍复用同步 urllib/curl_cffi，整体由 asyncio 队列统一调度
+- 同步/异步协同：HTTP 请求复用同步 httpx，整体由 asyncio 队列统一调度
 """
 
 import asyncio
 import json
+import os
+import ssl
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 # ============ 配置参数 ============
 API_BASE = "https://gptfreetoken.pony.indevs.in"
@@ -49,12 +51,78 @@ TOKEN_SAVE_DIR = env_config.get("TOKEN_SAVE_DIR", "")
 POLL_INTERVAL_SECONDS = int(env_config.get("TOKEN_ATLAS_POLL_INTERVAL_SECONDS", "30"))
 POLL_MAX_ATTEMPTS = int(env_config.get("TOKEN_ATLAS_POLL_MAX_ATTEMPTS", "20"))
 DOWNLOAD_CONCURRENCY = max(1, int(env_config.get("TOKEN_ATLAS_DOWNLOAD_CONCURRENCY", "3")))
+VERIFY_SSL = env_config.get("TOKEN_ATLAS_VERIFY_SSL", os.environ.get("TOKEN_ATLAS_VERIFY_SSL", "true")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 # =================================
 
 HISTORY_FILE = SAVE_DIR / "request_history.json"
 HISTORY_LOCK = threading.Lock()
 
+
+def build_ssl_context(verify_ssl: bool) -> ssl.SSLContext:
+    """构造 SSL Context，默认校验证书，必要时可关闭校验"""
+    if verify_ssl:
+        return ssl.create_default_context()
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
 # ============ 基础请求函数 ============
+def _send_http_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    json_data: dict[str, Any] | None = None,
+    timeout: float = 30,
+    fallback_message: str = "[Warning] SSL 证书校验失败，尝试关闭校验后重试",
+) -> httpx.Response | None:
+    """统一发送 HTTP 请求，必要时回退到关闭 SSL 校验"""
+    try:
+        with httpx.Client(verify=build_ssl_context(VERIFY_SSL), timeout=timeout) as client:
+            response = client.request(method, url, headers=headers, json=json_data)
+            response.raise_for_status()
+            return response
+    except httpx.HTTPStatusError as e:
+        error_body = e.response.text if e.response is not None else ""
+        print(f"[Error] HTTP {e.response.status_code}: {error_body}")
+        return None
+    except httpx.ConnectError as e:
+        cause = e.__cause__
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            if VERIFY_SSL:
+                print(fallback_message)
+                try:
+                    with httpx.Client(verify=False, timeout=timeout) as client:
+                        response = client.request(method, url, headers=headers, json=json_data)
+                        response.raise_for_status()
+                        print(f"[HTTP] {method} {url.removeprefix(API_BASE)} -> {response.status_code} (SSL verify disabled)")
+                        return response
+                except httpx.HTTPStatusError as retry_error:
+                    retry_body = retry_error.response.text if retry_error.response is not None else ""
+                    print(f"[Error] HTTP {retry_error.response.status_code}: {retry_body}")
+                    return None
+                except Exception as retry_error:
+                    print(f"[Error] SSL 回退重试失败: {retry_error}")
+                    return None
+            print(f"[Error] SSL 证书校验失败: {e}")
+            return None
+        print(f"[Error] {e}")
+        return None
+    except httpx.HTTPError as e:
+        print(f"[Error] {e}")
+        return None
+    except Exception as e:
+        print(f"[Error] {e}")
+        return None
+
+
 def _request(
     method: str,
     endpoint: str,
@@ -78,21 +146,15 @@ def _request(
     elif use_session and SESSION_COOKIE:
         headers["Cookie"] = f"token_atlas_session={SESSION_COOKIE}"
 
-    body_data = json.dumps(data).encode("utf-8") if data else None
-    req = urllib.request.Request(url, data=body_data, headers=headers, method=method)
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8")
-            result = json.loads(body)
-            print(f"[HTTP] {method} {endpoint} -> {resp.status}")
-            return result
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else ""
-        print(f"[Error] HTTP {e.code}: {error_body}")
+    response = _send_http_request(method, url, headers=headers, json_data=data)
+    if response is None:
         return None
-    except Exception as e:
-        print(f"[Error] {e}")
+
+    print(f"[HTTP] {method} {endpoint} -> {response.status_code}")
+    try:
+        return response.json()
+    except json.JSONDecodeError as e:
+        print(f"[Error] 响应 JSON 解析失败: {e}")
         return None
 
 
@@ -136,20 +198,20 @@ def download_archive() -> bytes | None:
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Cookie": f"token_atlas_session={SESSION_COOKIE}",
     }
-    req = urllib.request.Request(url, headers=headers, method="GET")
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
-            print(f"[GET /me/claims/archive] Status: {resp.status}, Size: {len(data)} bytes")
-            return data
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else ""
-        print(f"[Error] HTTP {e.code}: {error_body}")
+    response = _send_http_request(
+        "GET",
+        url,
+        headers=headers,
+        timeout=60,
+        fallback_message="[Warning] SSL 证书校验失败，尝试关闭校验后重试归档下载",
+    )
+    if response is None:
         return None
-    except Exception as e:
-        print(f"[Error] {e}")
-        return None
+
+    data = response.content
+    print(f"[GET /me/claims/archive] Status: {response.status_code}, Size: {len(data)} bytes")
+    return data
 
 
 # ============ API Key 接口 ============
@@ -170,7 +232,7 @@ def download_token(token_id: str) -> dict[str, Any] | None:
 
 
 # ============ 历史记录管理 ============
-TERMINAL_STATUSES = ("completed", "failed", "error", "success", "succeeded")
+TERMINAL_STATUSES = ("completed", "failed", "error", "success", "succeeded", "expired")
 DOWNLOAD_SUCCESS_STATUSES = ("completed", "downloaded", "uploaded")
 
 
