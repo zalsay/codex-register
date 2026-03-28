@@ -22,6 +22,18 @@ from urllib.parse import urlparse, parse_qs, urlencode
 
 from curl_cffi import requests as curl_requests
 
+# 全局线程锁
+_print_lock = threading.Lock()
+_file_lock = threading.Lock()
+VERBOSE_LOGS = False
+
+
+def _log(message):
+    if not VERBOSE_LOGS:
+        return
+    with _print_lock:
+        print(message)
+
 # ================= 加载配置 =================
 def _load_config():
     """从 config.json 加载配置，环境变量优先级更高"""
@@ -51,7 +63,7 @@ def _load_config():
                 file_config = json.load(f)
                 config.update(file_config)
         except Exception as e:
-            print(f"⚠️ 加载 config.json 失败: {e}")
+            _log(f"⚠️ 加载 config.json 失败: {e}")
 
     # 环境变量优先级更高
     config["yydsmail_api_base"] = os.environ.get("YYDSMAIL_API_BASE", config["yydsmail_api_base"])
@@ -99,9 +111,9 @@ UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
 CPA_CLEANUP_ENABLED = _as_bool(_CONFIG.get("cpa_cleanup_enabled", True))
 
 if not YYDSMAIL_API_KEY:
-    print("⚠️ 警告: 未设置 YYDSMAIL_API_KEY，请在 config.json 中设置或设置环境变量")
-    print("   文件: config.json -> yydsmail_api_key")
-    print("   环境变量: export YYDSMAIL_API_KEY='your_api_key_here'")
+    _log("⚠️ 警告: 未设置 YYDSMAIL_API_KEY，请在 config.json 中设置或设置环境变量")
+    _log("   文件: config.json -> yydsmail_api_key")
+    _log("   环境变量: export YYDSMAIL_API_KEY='your_api_key_here'")
 
 # 全局线程锁
 _print_lock = threading.Lock()
@@ -370,6 +382,47 @@ def _decode_jwt_payload(token: str):
         return {}
 
 
+def _token_dir_path():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    token_dir = TOKEN_JSON_DIR
+    if not isinstance(token_dir, str):
+        token_dir = str(token_dir)
+    return token_dir if os.path.isabs(token_dir) else os.path.join(base_dir, token_dir)
+
+
+def _upload_history_path(token_dir: str):
+    return os.path.join(token_dir, "uploaded_json_history.json")
+
+
+def _load_uploaded_json_history(token_dir: str):
+    history_path = _upload_history_path(token_dir)
+    if not os.path.exists(history_path):
+        return set()
+    try:
+        with open(history_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+
+    if isinstance(data, list):
+        return {str(item) for item in data if str(item).strip()}
+    if isinstance(data, dict):
+        files = data.get("files", [])
+        if isinstance(files, list):
+            return {str(item) for item in files if str(item).strip()}
+    return set()
+
+
+def _save_uploaded_json_history(token_dir: str, history_names):
+    history_path = _upload_history_path(token_dir)
+    payload = {
+        "files": sorted({str(item) for item in history_names if str(item).strip()})
+    }
+    with _file_lock:
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _save_codex_tokens(email: str, tokens: dict):
     access_token = tokens.get("access_token", "")
     refresh_token = tokens.get("refresh_token", "")
@@ -414,8 +467,7 @@ def _save_codex_tokens(email: str, tokens: dict):
         "refresh_token": refresh_token,
     }
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
+    token_dir = _token_dir_path()
     os.makedirs(token_dir, exist_ok=True)
 
     token_path = os.path.join(token_dir, f"{email}.json")
@@ -435,21 +487,17 @@ def _upload_token_json(filepath, proxy=None):
         mp.addpart(name="file", content_type="application/json",
                    filename=filename, local_path=filepath)
         session = curl_requests.Session()
-        # 只有当 proxy 明确有值时才使用代理
-        # proxy=None 或 空字符串 表示不使用代理
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
         resp = session.post(UPLOAD_API_URL, multipart=mp,
                             headers={"Authorization": f"Bearer {UPLOAD_API_TOKEN}"},
                             verify=False, timeout=30)
         if resp.status_code == 200:
-            print(f"  [CPA] ✅ {filename} 已上传到 CPA 管理平台")
+            _log(f"  [CPA] {filename} 上传成功")
             return True
         else:
-            print(f"  [CPA] ❌ {filename} 上传失败: {resp.status_code} - {resp.text[:200]}")
             return False
-    except Exception as e:
-        print(f"  [CPA] ❌ {os.path.basename(filepath)} 上传异常: {e}")
+    except Exception:
         return False
     finally:
         if mp:
@@ -457,52 +505,36 @@ def _upload_token_json(filepath, proxy=None):
 
 
 def _upload_all_tokens_to_cpa(proxy=None):
-    """批量上传 codex_tokens 目录下所有 JSON 文件到 CPA，保存到子目录并从子目录上传"""
+    """批量上传 codex_tokens 目录下未上传过的 JSON 文件到 CPA，成功文件写入历史记录"""
     if not UPLOAD_API_URL:
-        print("\n[CPA] ⚠️ 未配置 upload_api_url，跳过 CPA 上传")
         return
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
-
+    token_dir = _token_dir_path()
     if not os.path.isdir(token_dir):
-        print(f"\n[CPA] ⚠️ codex_tokens 目录不存在: {token_dir}")
         return
-
-    json_files = [f for f in os.listdir(token_dir) if f.endswith(".json")]
+    uploaded_history = _load_uploaded_json_history(token_dir)
+    json_files = [
+        f for f in os.listdir(token_dir)
+        if f.endswith(".json")
+        and f != os.path.basename(_upload_history_path(token_dir))
+        and f not in uploaded_history
+    ]
     if not json_files:
-        print(f"\n[CPA] ⚠️ codex_tokens 目录下没有 JSON 文件")
         return
-
-    # 创建带时间戳的子目录
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     sub_dir = os.path.join(token_dir, f"upload_{timestamp}")
     os.makedirs(sub_dir, exist_ok=True)
-
-    # 移动文件到子目录
     for filename in json_files:
         src_path = os.path.join(token_dir, filename)
         dst_path = os.path.join(sub_dir, filename)
         os.rename(src_path, dst_path)
-
-    print(f"\n{'='*60}")
-    print(f"  [CPA] 开始上传 {len(json_files)} 个账号到 CPA 管理平台")
-    print(f"  [CPA] 从子目录上传: {sub_dir}")
-    print(f"{'='*60}")
-
-    uploaded = 0
-    failed = 0
+    uploaded_names = set(uploaded_history)
     for filename in json_files:
         filepath = os.path.join(sub_dir, filename)
         if _upload_token_json(filepath, proxy=proxy):
-            uploaded += 1
-        else:
-            failed += 1
-
-    print(f"\n  [CPA] 上传完成: 成功 {uploaded} 个, 失败 {failed} 个")
-    print(f"  [CPA] 上传目录已保留: {sub_dir}")
-    print(f"{'='*60}")
+            uploaded_names.add(filename)
+    _save_uploaded_json_history(token_dir, uploaded_names)
+    _log(f"  [CPA] 上传完成: {len(json_files)} 个文件")
 
 
 # ================= CPA Codex 清理引擎 (内嵌) =================
@@ -881,9 +913,8 @@ def _cpa_execute_cleanup(payload, log=None):
 
 def _run_cpa_cleanup_before_register():
     """在注册前执行 CPA 无效号清理，失败不阻断注册流程"""
-    print(f"\n{'='*60}")
-    print("  [CPA清理] 注册前清理 CPA 无效号...")
-    print(f"{'='*60}")
+    if not VERBOSE_LOGS:
+        return
     try:
         payload = {
             "management_url": UPLOAD_API_URL,
@@ -893,15 +924,10 @@ def _run_cpa_cleanup_before_register():
             "delete_workers": 8,
             "max_active_probes": 120,
         }
-        result = _cpa_execute_cleanup(payload, log=lambda msg: print(f"  {msg}"))
-        print(f"\n  [CPA清理] 清理完成: 扫描 {result['scanned_total']} 个, "
-              f"命中 {result['matched_total']} 个, 删除 {result['deleted_total']} 个")
-        if result["failures"]:
-            print(f"  [CPA清理] 失败: {len(result['failures'])} 个")
-    except Exception as e:
-        print(f"  [CPA清理] ⚠️ 清理失败 (不影响注册): {e}")
-        traceback.print_exc()
-    print(f"{'='*60}\n")
+        _cpa_execute_cleanup(payload, log=lambda msg: _log(msg))
+        print(f"  [CPA清理] 完成")
+    except Exception:
+        pass
 
 
 def _generate_password(length=14):
@@ -973,37 +999,20 @@ def create_temp_email():
 
 def delete_temp_email(mail_token: str, inbox_id: str):
     """删除 YYDS Mail 临时邮箱"""
-    if not inbox_id:
-        print("[YYDS Mail] 删除失败: inbox_id 为空")
+    if not inbox_id or not mail_token:
         return False
-    if not mail_token:
-        print("[YYDS Mail] 删除失败: mail_token 为空")
-        return False
-
     try:
         api_base = YYDSMAIL_API_BASE.rstrip("/")
-        # 文档要求使用 Temp token 认证
         headers = {"Authorization": f"Bearer {mail_token}"}
         session = _create_yydsmail_session()
-
-        print(f"[YYDS Mail] 正在删除邮箱: {inbox_id}")
         res = session.delete(
             f"{api_base}/v1/accounts/{inbox_id}",
             headers=headers,
             timeout=15,
             impersonate="chrome131"
         )
-
-        print(f"[YYDS Mail] 删除响应: {res.status_code} - {res.text[:200] if res.text else 'empty'}")
-
-        if res.status_code in [200, 204]:
-            print(f"[YYDS Mail] 临时邮箱已删除: {inbox_id}")
-            return True
-        else:
-            print(f"[YYDS Mail] 删除邮箱失败: {res.status_code}")
-            return False
-    except Exception as e:
-        print(f"[YYDS Mail] 删除邮箱异常: {e}")
+        return res.status_code in [200, 204]
+    except Exception:
         return False
 
 
@@ -1013,7 +1022,6 @@ def _fetch_emails_yydsmail(mail_token: str, email: str):
         api_base = YYDSMAIL_API_BASE.rstrip("/")
         headers = {"Authorization": f"Bearer {mail_token}"}
         session = _create_yydsmail_session()
-
         res = session.get(
             f"{api_base}/v1/messages",
             params={"address": email},
@@ -1021,12 +1029,10 @@ def _fetch_emails_yydsmail(mail_token: str, email: str):
             timeout=15,
             impersonate="chrome131"
         )
-
         if res.status_code == 200:
             data = res.json()
             if data.get("success"):
                 response_data = data.get("data", [])
-                # YYDS Mail 返回 data 是 {"messages": [...], "total": N}
                 if isinstance(response_data, dict):
                     messages = response_data.get("messages", [])
                     if isinstance(messages, list):
@@ -1034,8 +1040,7 @@ def _fetch_emails_yydsmail(mail_token: str, email: str):
                 elif isinstance(response_data, list):
                     return response_data
         return []
-    except Exception as e:
-        print(f"[YYDS Mail] fetch emails error: {e}")
+    except Exception:
         return []
 
 
@@ -1045,7 +1050,6 @@ def _fetch_email_detail_yydsmail(mail_token: str, msg_id: str, email: str):
         api_base = YYDSMAIL_API_BASE.rstrip("/")
         headers = {"Authorization": f"Bearer {mail_token}"}
         session = _create_yydsmail_session()
-
         res = session.get(
             f"{api_base}/v1/messages/{msg_id}",
             params={"address": email},
@@ -1053,19 +1057,17 @@ def _fetch_email_detail_yydsmail(mail_token: str, msg_id: str, email: str):
             timeout=15,
             impersonate="chrome131"
         )
-
         if res.status_code == 200:
             data = res.json()
             if data.get("success"):
                 detail = data.get("data")
-                # 处理 html 字段可能是数组的情况
                 if isinstance(detail, dict):
                     html = detail.get("html")
                     if isinstance(html, list) and len(html) > 0:
                         detail["html"] = html[0]
                 return detail
-    except Exception as e:
-        print(f"[YYDS Mail] fetch detail error: {e}")
+    except Exception:
+        pass
     return None
 
 
@@ -1185,6 +1187,8 @@ class ChatGPTRegister:
         self._callback_url = None
 
     def _log(self, step, method, url, status, body=None):
+        if not VERBOSE_LOGS:
+            return
         prefix = f"[{self.tag}] " if self.tag else ""
         lines = [
             f"\n{'='*60}",
@@ -1202,6 +1206,8 @@ class ChatGPTRegister:
             print("\n".join(lines))
 
     def _print(self, msg):
+        if not VERBOSE_LOGS:
+            return
         prefix = f"[{self.tag}] " if self.tag else ""
         with _print_lock:
             print(f"{prefix}{msg}")
@@ -2273,12 +2279,7 @@ def _register_one(idx, total, proxy, output_file):
         birthdate = _random_birthdate()
 
         with _print_lock:
-            print(f"\n{'='*60}")
             print(f"  [{idx}/{total}] 注册: {email}")
-            print(f"  ChatGPT密码: {chatgpt_password}")
-            print(f"  邮箱密码: {email_pwd}")
-            print(f"  姓名: {name} | 生日: {birthdate}")
-            print(f"{'='*60}")
 
         # 2. 执行注册流程
         reg.run_register(email, chatgpt_password, name, birthdate, mail_token)
@@ -2304,7 +2305,7 @@ def _register_one(idx, total, proxy, output_file):
                 out.write(f"{email}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n")
 
         with _print_lock:
-            print(f"\n[OK] [{tag}] {email} 注册成功!")
+            print(f"[OK] [{tag}] {email} 注册成功!")
 
         # 5. 删除临时邮箱
         if reg and inbox_id and mail_token:
@@ -2315,8 +2316,7 @@ def _register_one(idx, total, proxy, output_file):
     except Exception as e:
         error_msg = str(e)
         with _print_lock:
-            print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
-            traceback.print_exc()
+            print(f"[FAIL] [{idx}] 注册失败: {error_msg}")
 
         # 失败时也删除临时邮箱
         if reg and inbox_id and mail_token:
@@ -2330,23 +2330,9 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     """并发批量注册 - YYDS Mail 临时邮箱版"""
 
     if not YYDSMAIL_API_KEY:
-        print("❌ 错误: 未设置 YYDSMAIL_API_KEY 环境变量")
-        print("   请设置: export YYDSMAIL_API_KEY='your_api_key_here'")
-        print("   或: set YYDSMAIL_API_KEY=your_api_key_here (Windows)")
         return
 
     actual_workers = min(max_workers, total_accounts)
-    print(f"\n{'#'*60}")
-    print(f"  ChatGPT 批量自动注册 (YYDS Mail 临时邮箱版)")
-    print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
-    print(f"  YYDS Mail: {YYDSMAIL_API_BASE}")
-    print(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")
-    if ENABLE_OAUTH:
-        print(f"  OAuth Issuer: {OAUTH_ISSUER}")
-        print(f"  OAuth Client: {OAUTH_CLIENT_ID}")
-        print(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
-    print(f"  输出文件: {output_file}")
-    print(f"{'#'*60}\n")
 
     # 注册前清理 CPA 无效号
     do_cleanup = cpa_cleanup if cpa_cleanup is not None else CPA_CLEANUP_ENABLED
@@ -2354,8 +2340,6 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         _run_cpa_cleanup_before_register()
 
     success_count = 0
-    fail_count = 0
-    start_time = time.time()
 
     with ThreadPoolExecutor(max_workers=actual_workers) as executor:
         futures = {}
@@ -2366,28 +2350,12 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
             futures[future] = idx
 
         for future in as_completed(futures):
-            idx = futures[future]
             try:
                 ok, email, err = future.result()
                 if ok:
                     success_count += 1
-                else:
-                    fail_count += 1
-                    print(f"  [账号 {idx}] 失败: {err}")
-            except Exception as e:
-                fail_count += 1
-                with _print_lock:
-                    print(f"[FAIL] 账号 {idx} 线程异常: {e}")
-
-    elapsed = time.time() - start_time
-    avg = elapsed / total_accounts if total_accounts else 0
-    print(f"\n{'#'*60}")
-    print(f"  注册完成! 耗时 {elapsed:.1f} 秒")
-    print(f"  总数: {total_accounts} | 成功: {success_count} | 失败: {fail_count}")
-    print(f"  平均速度: {avg:.1f} 秒/个")
-    if success_count > 0:
-        print(f"  结果文件: {output_file}")
-    print(f"{'#'*60}")
+            except Exception:
+                pass
 
     # 注册流程结束后，自动上传到 CPA 并清理
     if success_count > 0:
@@ -2395,43 +2363,19 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
 
 
 def main():
-    print("=" * 60)
-    print("  ChatGPT 批量自动注册工具 (YYDS Mail 临时邮箱版)")
-    print("=" * 60)
-
     # 检查 YYDS Mail 配置
     if not YYDSMAIL_API_KEY:
-        print("\n⚠️  警告: 未设置 YYDSMAIL_API_KEY")
-        print("   请编辑 config.json 设置 yydsmail_api_key，或设置环境变量:")
-        print("   Windows: set YYDSMAIL_API_KEY=your_api_key_here")
-        print("   Linux/Mac: export YYDSMAIL_API_KEY='your_api_key_here'")
-        print("\n   按 Enter 继续尝试运行 (可能会失败)...")
-        input()
+        return
 
     # 交互式代理配置
     proxy = DEFAULT_PROXY
-    if proxy:
-        print(f"[Info] 检测到默认代理: {proxy}")
-        # use_default = input("使用此代理? (Y/n): ").strip().lower()
-        # if use_default == "n":
-        #     proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
-    else:
+    if not proxy:
         env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
                  or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
         if env_proxy:
-            print(f"[Info] 检测到环境变量代理: {env_proxy}")
-            # use_env = input("使用此代理? (Y/n): ").strip().lower()
-            # if use_env == "n":
-            #     proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
-            # else:
             proxy = env_proxy
         else:
             proxy = input("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理): ").strip() or None
-
-    if proxy:
-        print(f"[Info] 使用代理: {proxy}")
-    else:
-        print("[Info] 不使用代理")
 
     # 注册前是否清理 CPA 无效号（直接使用配置）
     cpa_cleanup = CPA_CLEANUP_ENABLED if UPLOAD_API_URL else False

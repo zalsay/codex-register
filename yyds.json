@@ -2,7 +2,7 @@
   "_comment": "ChatGPT 批量自动注册工具配置文件 (YYDS Mail 临时邮箱版)",
   "total_accounts": 10,
   "yydsmail_api_base": "https://maliapi.215.im",
-  "yydsmail_api_key": "AC-a5e176f5a962dc68f5716bf6",
+  "yydsmail_api_key": "",
   "proxy": "127.0.0.1:7897",
   "output_file": "registered_accounts.txt",
   "enable_oauth": true,
@@ -13,6 +13,6 @@
   "ak_file": "ak.txt",
   "rk_file": "rk.txt",
   "token_json_dir": "yyds_tokens",
-  "upload_api_url": "http://ts.meetlife.top:8318/v0/management/auth-files",
-  "upload_api_token": "Cqlzy@1277"
+  "upload_api_url": "",
+  "upload_api_token": ""
 }
