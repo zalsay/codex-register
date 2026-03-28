@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -546,6 +548,72 @@ func loadEnvFile(path string) (map[string]string, error) {
 	return result, nil
 }
 
+func shortBody(data []byte, limit int) string {
+	if len(data) == 0 {
+		return ""
+	}
+	text := strings.ReplaceAll(string(data), "\n", "\\n")
+	text = strings.ReplaceAll(text, "\r", "\\r")
+	if len(text) > limit {
+		return text[:limit] + "..."
+	}
+	return text
+}
+
+func maskedHeaders(headers map[string]string) map[string]string {
+	masked := make(map[string]string, len(headers))
+	for k, v := range headers {
+		switch strings.ToLower(k) {
+		case "cookie":
+			if len(v) > 24 {
+				masked[k] = v[:24] + "...(masked)"
+			} else if v != "" {
+				masked[k] = "(masked)"
+			} else {
+				masked[k] = v
+			}
+		case "x-api-key", "authorization":
+			if v != "" {
+				masked[k] = "(masked)"
+			} else {
+				masked[k] = v
+			}
+		default:
+			masked[k] = v
+		}
+	}
+	return masked
+}
+
+func classifyNetworkError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "timeout"
+		}
+		return "net_error"
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return "connection_reset"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "connection reset by peer"):
+		return "connection_reset"
+	case strings.Contains(message, "tls"):
+		return "tls_error"
+	case strings.Contains(message, "no such host"):
+		return "dns_error"
+	case strings.Contains(message, "eof"):
+		return "unexpected_eof"
+	default:
+		return "request_error"
+	}
+}
+
 func NewAPIClient(cfg Config) *APIClient {
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: !cfg.VerifySSL}}
 	fallbackTransport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}}
@@ -571,11 +639,26 @@ func (c *APIClient) requestJSON(ctx context.Context, method, endpoint string, bo
 	if useSession && c.cfg.SessionCookie != "" {
 		headers["Cookie"] = fmt.Sprintf("token_atlas_session=%s", c.cfg.SessionCookie)
 	}
+	fmt.Printf("[HTTP Debug] preparing request method=%s endpoint=%s timeout=%s apiKey=%t session=%t verifySSL=%t headers=%v\n",
+		method,
+		endpoint,
+		30*time.Second,
+		useAPIKey,
+		useSession,
+		c.cfg.VerifySSL,
+		maskedHeaders(headers),
+	)
+	if body != nil {
+		payload, _ := json.Marshal(body)
+		fmt.Printf("[HTTP Debug] request body endpoint=%s body=%s\n", endpoint, shortBody(payload, 300))
+	}
 	respBody, status, err := c.do(ctx, method, url, headers, body, 30*time.Second, "[Warning] SSL 证书校验失败，尝试关闭校验后重试")
 	if err != nil {
+		fmt.Printf("[HTTP Debug] request failed method=%s endpoint=%s err=%T %v kind=%s\n", method, endpoint, err, err, classifyNetworkError(err))
 		return nil, err
 	}
 	fmt.Printf("[HTTP] %s %s -> %d\n", method, endpoint, status)
+	fmt.Printf("[HTTP Debug] response snippet endpoint=%s body=%s\n", endpoint, shortBody(respBody, 500))
 	var result map[string]any
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("响应 JSON 解析失败: %w", err)
@@ -586,23 +669,28 @@ func (c *APIClient) requestJSON(ctx context.Context, method, endpoint string, bo
 func (c *APIClient) do(ctx context.Context, method, url string, headers map[string]string, body map[string]any, timeout time.Duration, fallbackMessage string) ([]byte, int, error) {
 	client := c.httpClient
 	client.Timeout = timeout
+	fmt.Printf("[HTTP Debug] dispatch primary client method=%s url=%s timeout=%s\n", method, url, timeout)
 	respBody, status, err := doRequest(ctx, client, method, url, headers, body)
 	if err == nil {
 		return respBody, status, nil
 	}
+	fmt.Printf("[HTTP Debug] primary client failed method=%s url=%s err=%T %v kind=%s\n", method, url, err, err, classifyNetworkError(err))
 	var urlErr *urlError
 	if errors.As(err, &urlErr) && c.cfg.VerifySSL {
 		fmt.Println(fallbackMessage)
 		c.fallbackClient.Timeout = timeout
+		fmt.Printf("[HTTP Debug] dispatch fallback client method=%s url=%s timeout=%s verifySSL=false\n", method, url, timeout)
 		respBody, status, fallbackErr := doRequest(ctx, c.fallbackClient, method, url, headers, body)
 		if fallbackErr == nil {
 			fmt.Printf("[HTTP] %s %s -> %d (SSL verify disabled)\n", method, strings.TrimPrefix(url, c.cfg.APIBase), status)
 			return respBody, status, nil
 		}
+		fmt.Printf("[HTTP Debug] fallback client failed method=%s url=%s err=%T %v kind=%s\n", method, url, fallbackErr, fallbackErr, classifyNetworkError(fallbackErr))
 		return nil, 0, fallbackErr
 	}
 	return nil, 0, err
 }
+
 
 type urlError struct{ err error }
 
@@ -625,19 +713,33 @@ func doRequest(ctx context.Context, client *http.Client, method, url string, hea
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	start := time.Now()
+	fmt.Printf("[HTTP Debug] sending request method=%s host=%s path=%s contentLength=%d\n", method, req.URL.Host, req.URL.Path, req.ContentLength)
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("[HTTP Debug] client.Do failed method=%s host=%s path=%s elapsed=%s err=%T %v kind=%s\n", method, req.URL.Host, req.URL.Path, time.Since(start), err, err, classifyNetworkError(err))
 		if strings.Contains(strings.ToLower(err.Error()), "certificate") || strings.Contains(strings.ToLower(err.Error()), "x509") {
 			return nil, 0, &urlError{err: err}
 		}
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
+	fmt.Printf("[HTTP Debug] response headers received method=%s path=%s status=%d elapsed=%s contentLength=%d server=%s cfRay=%s\n",
+		method,
+		req.URL.Path,
+		resp.StatusCode,
+		time.Since(start),
+		resp.ContentLength,
+		resp.Header.Get("Server"),
+		resp.Header.Get("Cf-Ray"),
+	)
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		fmt.Printf("[HTTP Debug] read body failed method=%s path=%s elapsed=%s err=%T %v kind=%s\n", method, req.URL.Path, time.Since(start), err, err, classifyNetworkError(err))
 		return nil, 0, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Printf("[HTTP Debug] non-2xx response method=%s path=%s status=%d body=%s\n", method, req.URL.Path, resp.StatusCode, shortBody(respBody, 500))
 		return nil, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	return respBody, resp.StatusCode, nil
@@ -645,17 +747,21 @@ func doRequest(ctx context.Context, client *http.Client, method, url string, hea
 
 func (c *APIClient) GetMe(ctx context.Context) (map[string]any, error) {
 	if c.cfg.SessionCookie != "" {
+		fmt.Println("[Me] 尝试使用 Session 调用 /me")
 		result, err := c.requestJSON(ctx, http.MethodGet, "/me", nil, false, true)
 		if err == nil {
 			return result, nil
 		}
+		fmt.Printf("[Me] Session 调用 /me 失败: %T %v\n", err, err)
 		fmt.Println("[Me] Session 获取失败，尝试 API Key")
 	}
 	if c.cfg.APIKey == "" {
 		return nil, errors.New("未配置 API Key")
 	}
+	fmt.Println("[Me] 尝试使用 API Key 调用 /me")
 	return c.requestJSON(ctx, http.MethodGet, "/me", nil, true, false)
 }
+
 
 func (c *APIClient) SessionClaim(ctx context.Context, count int) (map[string]any, error) {
 	return c.requestJSON(ctx, http.MethodPost, "/me/claim", map[string]any{"count": count}, false, true)

@@ -3,6 +3,9 @@ set -e
 
 cd "$(dirname "$0")"
 
+ATLAS_BIN="token_atlas/dist/token-atlas"
+ATLAS_PYTHON_SCRIPT="token_atlas/token_atlas.py"
+
 # 初始化虚拟环境
 if [ ! -d ".venv" ]; then
     echo "Creating virtual environment..."
@@ -30,23 +33,42 @@ start_script() {
     echo "${script_name} started, log: ${script_name}.log"
 }
 
+stop_atlas() {
+    echo "Stopping atlas..."
+    pkill -f "python3 ${ATLAS_PYTHON_SCRIPT}" 2>/dev/null || true
+    pkill -f "python ${ATLAS_PYTHON_SCRIPT}" 2>/dev/null || true
+    pkill -f "${ATLAS_BIN}" 2>/dev/null || true
+}
+
+start_atlas_binary() {
+    if [ ! -x "${ATLAS_BIN}" ]; then
+        echo "Atlas binary not found, building it first..."
+        make -C token_atlas build
+    fi
+
+    echo "Starting atlas..."
+    nohup "$(pwd)/${ATLAS_BIN}" >> "atlas.log" 2>&1 &
+    echo "atlas started, log: atlas.log"
+}
+
 case "$1" in
     start|--yyds|"")
         stop_script "yyds" "yyds.py"
         start_script "yyds" "yyds.py"
         ;;
     --atlas)
-        stop_script "atlas" "token_atlas/token_atlas.py"
-        start_script "atlas" "token_atlas/token_atlas.py"
+        stop_atlas
+        start_atlas_binary
         ;;
     stop)
         stop_script "yyds" "yyds.py"
         ;;
     stop-atlas)
-        stop_script "atlas" "token_atlas/token_atlas.py"
+        stop_atlas
         ;;
     *)
         echo "Usage: $0 [start|--yyds|--atlas|stop|stop-atlas]"
         exit 1
         ;;
 esac
+

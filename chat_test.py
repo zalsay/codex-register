@@ -12,8 +12,8 @@ import urllib.error
 from typing import Any
 
 # ============ 配置参数 ============
-API_BASE = "http://i.meetlife.top:8318/v1"  # API 地址
-API_KEY = "sk-EZoBppkdFxprXuLbF9jeP76AVHjG6pRHD3M6oFvWECaECYO6"  # API Key
+API_BASE = "https://freeapi.dgbmc.top/v1"  # API 地址
+API_KEY = "sk-9v511doAzSviNUoZfDZpkW7UXdUVGwXejCAyGVThE9CaKT6n"  # API Key
 MODEL = "gpt-5.4"  # 模型名称
 PROXY = ""  # 代理地址 (如 http://127.0.0.1:7890)
 SYSTEM = "你是一个有帮助的AI助手。"  # 系统提示词
